@@ -51,8 +51,8 @@ python camera_preview.py --camera 0 --camera 1
 | `S` | Save a screenshot |
 | `F` or `F11` | Toggle full screen |
 | `Esc` or `Q` | Close the application |
-| `Ctrl` + `Shift` + `H` | Globally hide or restore all preview windows |
-| `\u5feb\u6377\u952e` button | Set a different global hide/show hotkey |
+| `Ctrl` + `H` | Globally hide or restore all preview windows |
+| `\u5feb\u6377\u952e` button | Set a different `Ctrl` + key global hide/show hotkey |
 
 Screenshots are saved in a `screenshots` folder beside the running application.
 
