@@ -204,6 +204,16 @@ def hotkey_from_event(event) -> GlobalHotkey | None:
     return hotkey if is_valid_hotkey(hotkey) else None
 
 
+def selectable_hotkeys() -> dict[str, GlobalHotkey]:
+    keys = list(range(ord("A"), ord("Z") + 1))
+    keys.extend(range(ord("0"), ord("9") + 1))
+    keys.extend(range(0x70, 0x70 + 12))
+    return {
+        hotkey.label: hotkey
+        for hotkey in (GlobalHotkey(MOD_CONTROL, key) for key in keys)
+    }
+
+
 @dataclass
 class OpenedCapture:
     index: int
@@ -695,13 +705,26 @@ class CameraManager:
         container.pack(fill=tk.BOTH, expand=True)
         ttk.Label(
             container,
-            text="\u76f4\u63a5\u6309\u4e0b Ctrl \u52a0\u4e00\u4e2a\u6309\u952e\uff0c\u7136\u540e\u70b9\u51fb\u5e94\u7528\u3002",
+            text="\u9009\u62e9 Ctrl \u52a0\u4e00\u4e2a\u6309\u952e\uff0c\u6216\u76f4\u63a5\u6309\u4e0b\u65b0\u7ec4\u5408\u952e\uff0c\u7136\u540e\u70b9\u51fb\u5e94\u7528\u3002",
         ).pack(anchor=tk.W)
 
         candidate = [self.hotkey]
+        shortcut_options = selectable_hotkeys()
+        shortcut_options.setdefault(candidate[0].label, candidate[0])
         shortcut_text = tk.StringVar(value=candidate[0].label)
-        capture = ttk.Entry(container, textvariable=shortcut_text, state="readonly", width=30)
-        capture.pack(fill=tk.X, pady=(10, 12))
+        selector = ttk.Combobox(
+            container,
+            textvariable=shortcut_text,
+            values=list(shortcut_options),
+            state="readonly",
+            width=28,
+        )
+        selector.pack(fill=tk.X, pady=(10, 12))
+
+        def select_shortcut(_event=None) -> None:
+            selected = shortcut_options.get(shortcut_text.get())
+            if selected is not None:
+                candidate[0] = selected
 
         def capture_shortcut(event) -> str:
             hotkey = hotkey_from_event(event)
@@ -742,10 +765,23 @@ class CameraManager:
         ttk.Button(buttons, text="\u53d6\u6d88", command=close_dialog).pack(side=tk.RIGHT, padx=(0, 6))
         ttk.Button(buttons, text="\u6062\u590d\u9ed8\u8ba4", command=use_default).pack(side=tk.LEFT)
 
-        capture.bind("<KeyPress>", capture_shortcut)
+        selector.bind("<<ComboboxSelected>>", select_shortcut)
+        selector.bind("<KeyPress>", capture_shortcut)
         dialog.bind("<KeyPress>", capture_shortcut)
         dialog.protocol("WM_DELETE_WINDOW", close_dialog)
-        dialog.after_idle(dialog.focus_force)
+
+        def position_dialog() -> None:
+            try:
+                dialog.update_idletasks()
+                left = parent.winfo_rootx() + (parent.winfo_width() - dialog.winfo_width()) // 2
+                top = parent.winfo_rooty() + (parent.winfo_height() - dialog.winfo_height()) // 2
+                dialog.geometry(f"+{max(0, left)}+{max(0, top)}")
+                dialog.lift()
+                dialog.focus_force()
+            except tk.TclError:
+                pass
+
+        dialog.after_idle(position_dialog)
 
     def scan_for_cameras(self) -> None:
         if self.shutting_down:
