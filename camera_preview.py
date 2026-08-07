@@ -40,7 +40,7 @@ MOD_CONTROL = 0x0002
 MOD_SHIFT = 0x0004
 MOD_NOREPEAT = 0x4000
 VK_H = 0x48
-DEFAULT_HOTKEY_MODIFIERS = MOD_CONTROL | MOD_SHIFT
+DEFAULT_HOTKEY_MODIFIERS = MOD_CONTROL
 HOTKEY_SETTINGS_FILENAME = "camera_preview_settings.json"
 TK_SHIFT_MASK = 0x0001
 TK_CONTROL_MASK = 0x0004
@@ -176,12 +176,7 @@ DEFAULT_HOTKEY = GlobalHotkey(DEFAULT_HOTKEY_MODIFIERS, VK_H)
 
 
 def is_valid_hotkey(hotkey: GlobalHotkey) -> bool:
-    allowed_modifiers = MOD_ALT | MOD_CONTROL | MOD_SHIFT
-    return (
-        bool(hotkey.modifiers & (MOD_ALT | MOD_CONTROL))
-        and not hotkey.modifiers & ~allowed_modifiers
-        and 1 <= hotkey.key <= 0xFF
-    )
+    return hotkey.modifiers == MOD_CONTROL and 1 <= hotkey.key <= 0xFF
 
 
 def virtual_key_from_keysym(keysym: str) -> int | None:
@@ -694,7 +689,7 @@ class CameraManager:
         container.pack(fill=tk.BOTH, expand=True)
         ttk.Label(
             container,
-            text="\u70b9\u51fb\u8f93\u5165\u6846\uff0c\u7136\u540e\u6309\u4e0b\u65b0\u7ec4\u5408\u952e\u3002\u5fc5\u987b\u5305\u542b Ctrl \u6216 Alt\u3002",
+            text="\u70b9\u51fb\u8f93\u5165\u6846\uff0c\u7136\u540e\u6309\u4e0b Ctrl \u52a0\u4e00\u4e2a\u6309\u952e\u3002",
         ).pack(anchor=tk.W)
 
         candidate = [self.hotkey]
