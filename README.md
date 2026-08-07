@@ -4,7 +4,8 @@ A lightweight Windows desktop application for viewing a UVC camera feed.
 
 ## Features
 
-- Live preview for Windows UVC cameras
+- Simultaneous previews for all connected Windows UVC cameras
+- One movable and resizable desktop window for each camera
 - Mouse-wheel zoom centered on the cursor
 - Standard Windows close button, plus keyboard shortcuts
 - Screenshot capture
@@ -29,10 +30,15 @@ Use `--list` to find usable camera indexes:
 python camera_preview.py --list
 ```
 
-The default camera index is `0`. For another camera, use for example:
+By default, the application scans for all usable cameras and opens one window
+per camera. Drag a window's title bar to place that feed anywhere on the
+desktop. Use the `Scan` button after connecting another camera while the
+application is already running.
+
+To open only selected cameras, repeat `--camera`:
 
 ```powershell
-python camera_preview.py --camera 1
+python camera_preview.py --camera 0 --camera 1
 ```
 
 ## Controls
@@ -59,4 +65,3 @@ The generated executable is placed in `dist/CameraPreview.exe`.
 ## License
 
 This project is released under the [MIT License](LICENSE).
-
