@@ -10,6 +10,7 @@ A lightweight Windows desktop application for viewing a UVC camera feed.
 - Standard Windows close button, plus keyboard shortcuts
 - Screenshot capture
 - Full-screen mode
+- Configurable global hide/show hotkey, saved beside the application
 
 ## Requirements
 
@@ -51,6 +52,7 @@ python camera_preview.py --camera 0 --camera 1
 | `F` or `F11` | Toggle full screen |
 | `Esc` or `Q` | Close the application |
 | `Ctrl` + `Shift` + `H` | Globally hide or restore all preview windows |
+| `\u5feb\u6377\u952e` button | Set a different global hide/show hotkey |
 
 Screenshots are saved in a `screenshots` folder beside the running application.
 
