@@ -1,7 +1,8 @@
-"""Display a Windows UVC camera in a responsive desktop window.
+"""Display one or more Windows UVC cameras in movable desktop windows.
 
-Controls: mouse wheel zooms around the cursor, R resets zoom, S saves a
-screenshot, F/F11 toggles full screen, and Q closes the program.
+Each detected camera receives its own standard Windows window. Move a preview
+by dragging its title bar. The mouse wheel zooms around the cursor inside an
+individual preview.
 """
 
 from __future__ import annotations
@@ -17,11 +18,12 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from tkinter import ttk
+from typing import Iterable
 
 import cv2
 
 
-WINDOW_TITLE = "摄像头预览"
+WINDOW_TITLE = "\u6444\u50cf\u5934\u9884\u89c8"
 BACKENDS = (
     ("DirectShow", cv2.CAP_DSHOW),
     ("Media Foundation", cv2.CAP_MSMF),
@@ -60,7 +62,7 @@ class ZoomView:
         self.top = min(max(self.top, 0.0), self.frame_height - crop_height)
 
     def zoom_at(self, relative_x: float, relative_y: float, direction: int) -> None:
-        """Zoom while keeping the source pixel under the mouse stationary."""
+        """Zoom while keeping the source pixel under the cursor stationary."""
         if not self.frame_width or not self.frame_height or not direction:
             return
 
@@ -93,6 +95,13 @@ class ZoomView:
         return cv2.resize(crop, (output_width, output_height), interpolation=cv2.INTER_LINEAR)
 
 
+@dataclass
+class OpenedCapture:
+    index: int
+    capture: cv2.VideoCapture
+    backend: str
+
+
 def configure_capture(capture: cv2.VideoCapture, width: int, height: int, fps: int) -> None:
     capture.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
     capture.set(cv2.CAP_PROP_FRAME_WIDTH, width)
@@ -100,7 +109,7 @@ def configure_capture(capture: cv2.VideoCapture, width: int, height: int, fps: i
     capture.set(cv2.CAP_PROP_FPS, fps)
 
 
-def open_capture(index: int, width: int, height: int, fps: int) -> tuple[cv2.VideoCapture, str]:
+def open_capture(index: int, width: int, height: int, fps: int) -> OpenedCapture:
     for backend_name, backend_id in BACKENDS:
         capture = cv2.VideoCapture(index, backend_id)
         if not capture.isOpened():
@@ -110,31 +119,43 @@ def open_capture(index: int, width: int, height: int, fps: int) -> tuple[cv2.Vid
         configure_capture(capture, width, height, fps)
         ok, _ = capture.read()
         if ok:
-            return capture, backend_name
+            return OpenedCapture(index=index, capture=capture, backend=backend_name)
         capture.release()
 
-    raise RuntimeError(
-        f"Cannot open camera {index}. Run with --list to find an available camera index."
-    )
+    raise RuntimeError(f"Cannot open camera {index}.")
+
+
+def open_captures(
+    indices: Iterable[int], width: int, height: int, fps: int
+) -> list[OpenedCapture]:
+    captures: list[OpenedCapture] = []
+    opened_indices: set[int] = set()
+    for index in indices:
+        if index < 0 or index in opened_indices:
+            continue
+        try:
+            opened = open_capture(index, width, height, fps)
+        except RuntimeError:
+            continue
+        captures.append(opened)
+        opened_indices.add(index)
+    return captures
 
 
 def list_cameras(max_index: int, width: int, height: int, fps: int) -> int:
-    found = 0
-    for index in range(max_index + 1):
-        try:
-            capture, backend = open_capture(index, width, height, fps)
-        except RuntimeError:
-            continue
+    captures = open_captures(range(max_index + 1), width, height, fps)
+    try:
+        for opened in captures:
+            actual_width = int(opened.capture.get(cv2.CAP_PROP_FRAME_WIDTH))
+            actual_height = int(opened.capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            print(
+                f"Camera {opened.index}: {actual_width}x{actual_height} via {opened.backend}"
+            )
+    finally:
+        for opened in captures:
+            opened.capture.release()
 
-        try:
-            actual_width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
-            actual_height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            print(f"Camera {index}: {actual_width}x{actual_height} via {backend}")
-            found += 1
-        finally:
-            capture.release()
-
-    if not found:
+    if not captures:
         print("No usable camera was found.")
         return 1
     return 0
@@ -146,27 +167,34 @@ def application_directory() -> Path:
     return Path(__file__).resolve().parent
 
 
-def save_frame(frame) -> Path:
+def save_frame(frame, camera_index: int) -> Path:
     screenshot_dir = application_directory() / "screenshots"
     screenshot_dir.mkdir(exist_ok=True)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_path = screenshot_dir / f"camera_{timestamp}.jpg"
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    output_path = screenshot_dir / f"camera_{camera_index}_{timestamp}.jpg"
     if not cv2.imwrite(str(output_path), frame):
         raise RuntimeError(f"Could not save {output_path}")
     return output_path
 
 
-class CameraApp:
-    """Tk owns all UI work; a daemon thread continuously reads the camera."""
+class CameraWindow:
+    """A movable preview window for one camera capture."""
 
-    def __init__(self, capture: cv2.VideoCapture, camera_index: int) -> None:
-        self.capture = capture
-        self.camera_index = camera_index
-        self.root = tk.Tk()
-        self.root.title(WINDOW_TITLE)
-        self.root.geometry("1000x700")
-        self.root.minsize(480, 360)
-        self.root.protocol("WM_DELETE_WINDOW", self.close)
+    def __init__(
+        self,
+        manager: "CameraManager",
+        opened: OpenedCapture,
+        position: int,
+    ) -> None:
+        self.manager = manager
+        self.capture = opened.capture
+        self.camera_index = opened.index
+        self.backend = opened.backend
+        self.window = tk.Toplevel(manager.root)
+        self.window.title(f"{WINDOW_TITLE} - \u6444\u50cf\u5934 {self.camera_index}")
+        self.window.minsize(480, 360)
+        self.window.geometry(self._initial_geometry(position))
+        self.window.protocol("WM_DELETE_WINDOW", self.close)
 
         self.zoom_view = ZoomView()
         self.running = True
@@ -176,29 +204,49 @@ class CameraApp:
         self.frame_count = 0
         self.fps = 0.0
         self.fps_start = time.perf_counter()
-        self.status_text = "正在打开摄像头..."
+        self.status_text = "Opening camera..."
         self.status_until = 0.0
         self.image_photo = None
         self.image_bounds: tuple[int, int, int, int] | None = None
 
         self._build_ui()
-        self.reader = threading.Thread(target=self._read_frames, name="camera-reader", daemon=True)
+        self.reader = threading.Thread(
+            target=self._read_frames,
+            name=f"camera-reader-{self.camera_index}",
+            daemon=True,
+        )
         self.reader.start()
-        self.root.after(15, self._draw_frame)
+        self.window.after(30, self._draw_frame)
+
+    @staticmethod
+    def _initial_geometry(position: int) -> str:
+        column = position % 3
+        row = position // 3
+        left = 40 + column * 55
+        top = 40 + row * 55
+        return f"900x620+{left}+{top}"
 
     def _build_ui(self) -> None:
-        toolbar = ttk.Frame(self.root, padding=(8, 6))
+        toolbar = ttk.Frame(self.window, padding=(8, 6))
         toolbar.pack(fill=tk.X)
-        ttk.Label(toolbar, text=f"摄像头 {self.camera_index}").pack(side=tk.LEFT)
-        self.zoom_label = ttk.Label(toolbar, text="缩放 x1.0")
+        ttk.Label(toolbar, text=f"\u6444\u50cf\u5934 {self.camera_index}").pack(side=tk.LEFT)
+        self.zoom_label = ttk.Label(toolbar, text="\u7f29\u653e x1.0")
         self.zoom_label.pack(side=tk.LEFT, padx=(14, 0))
         self.fps_label = ttk.Label(toolbar, text="0.0 FPS")
         self.fps_label.pack(side=tk.LEFT, padx=(14, 0))
-        ttk.Button(toolbar, text="重置", command=self.reset_zoom).pack(side=tk.RIGHT)
-        ttk.Button(toolbar, text="全屏", command=self.toggle_fullscreen).pack(side=tk.RIGHT, padx=(0, 6))
-        ttk.Button(toolbar, text="保存", command=self.save_screenshot).pack(side=tk.RIGHT, padx=(0, 6))
 
-        self.canvas = tk.Canvas(self.root, background="#101010", highlightthickness=0)
+        ttk.Button(toolbar, text="\u91cd\u7f6e", command=self.reset_zoom).pack(side=tk.RIGHT)
+        ttk.Button(toolbar, text="\u5168\u5c4f", command=self.toggle_fullscreen).pack(
+            side=tk.RIGHT, padx=(0, 6)
+        )
+        ttk.Button(toolbar, text="\u4fdd\u5b58", command=self.save_screenshot).pack(
+            side=tk.RIGHT, padx=(0, 6)
+        )
+        ttk.Button(toolbar, text="\u626b\u63cf", command=self.manager.scan_for_cameras).pack(
+            side=tk.RIGHT, padx=(0, 6)
+        )
+
+        self.canvas = tk.Canvas(self.window, background="#101010", highlightthickness=0)
         self.canvas.pack(fill=tk.BOTH, expand=True)
         self.image_id = self.canvas.create_image(0, 0, anchor=tk.NW)
         self.message_id = self.canvas.create_text(
@@ -207,20 +255,21 @@ class CameraApp:
             anchor=tk.NW,
             fill="#f1f5f9",
             font=("Segoe UI", 11),
-            text="正在打开摄像头...",
+            text="Opening camera...",
         )
+
         self.canvas.bind("<MouseWheel>", self.on_mouse_wheel)
-        self.root.bind("<MouseWheel>", self.on_mouse_wheel)
-        self.root.bind("<Key-r>", lambda _event: self.reset_zoom())
-        self.root.bind("<Key-R>", lambda _event: self.reset_zoom())
-        self.root.bind("<Key-s>", lambda _event: self.save_screenshot())
-        self.root.bind("<Key-S>", lambda _event: self.save_screenshot())
-        self.root.bind("<Key-f>", lambda _event: self.toggle_fullscreen())
-        self.root.bind("<Key-F>", lambda _event: self.toggle_fullscreen())
-        self.root.bind("<F11>", lambda _event: self.toggle_fullscreen())
-        self.root.bind("<Key-q>", lambda _event: self.close())
-        self.root.bind("<Key-Q>", lambda _event: self.close())
-        self.root.bind("<Escape>", self.on_escape)
+        self.window.bind("<MouseWheel>", self.on_mouse_wheel)
+        self.window.bind("<Key-r>", lambda _event: self.reset_zoom())
+        self.window.bind("<Key-R>", lambda _event: self.reset_zoom())
+        self.window.bind("<Key-s>", lambda _event: self.save_screenshot())
+        self.window.bind("<Key-S>", lambda _event: self.save_screenshot())
+        self.window.bind("<Key-f>", lambda _event: self.toggle_fullscreen())
+        self.window.bind("<Key-F>", lambda _event: self.toggle_fullscreen())
+        self.window.bind("<F11>", lambda _event: self.toggle_fullscreen())
+        self.window.bind("<Key-q>", lambda _event: self.close())
+        self.window.bind("<Key-Q>", lambda _event: self.close())
+        self.window.bind("<Escape>", self.on_escape)
 
     def _read_frames(self) -> None:
         failed_reads = 0
@@ -229,7 +278,7 @@ class CameraApp:
             if not ok:
                 failed_reads += 1
                 if failed_reads >= 30:
-                    self.status_text = "摄像头没有返回画面。"
+                    self.status_text = "Camera is not returning frames."
                 time.sleep(0.03)
                 continue
 
@@ -266,14 +315,13 @@ class CameraApp:
         return left, top, display_width, display_height
 
     @staticmethod
-    def _to_photo(frame):
-        # OpenCV's PNG encoder converts its BGR frame to the PNG RGB order.
-        # Converting here first would swap red and blue twice.
+    def _to_photo(frame, master=None):
+        # OpenCV converts BGR frames to PNG's RGB channel order when encoding.
         ok, encoded = cv2.imencode(".png", frame, [cv2.IMWRITE_PNG_COMPRESSION, 1])
         if not ok:
             raise RuntimeError("Could not encode camera frame for display.")
         encoded_base64 = base64.b64encode(encoded.tobytes()).decode("ascii")
-        return tk.PhotoImage(data=encoded_base64, format="png")
+        return tk.PhotoImage(master=master, data=encoded_base64, format="png")
 
     def _draw_frame(self) -> None:
         if not self.running:
@@ -285,18 +333,21 @@ class CameraApp:
             source_height, source_width = frame.shape[:2]
             left, top, display_width, display_height = self._display_size(source_width, source_height)
             display_frame = self.zoom_view.render(frame, display_width, display_height)
-            self.image_photo = self._to_photo(display_frame)
+            self.image_photo = self._to_photo(display_frame, self.window)
             self.canvas.itemconfigure(self.image_id, image=self.image_photo)
             self.canvas.coords(self.image_id, left, top)
             self.canvas.tag_lower(self.image_id)
             self.image_bounds = (left, top, display_width, display_height)
-            self.zoom_label.configure(text=f"缩放 x{self.zoom_view.zoom:.1f}")
+            self.zoom_label.configure(text=f"\u7f29\u653e x{self.zoom_view.zoom:.1f}")
             self.fps_label.configure(text=f"{self.fps:.1f} FPS")
             if time.perf_counter() > self.status_until:
                 self.status_text = ""
 
         self.canvas.itemconfigure(self.message_id, text=self.status_text)
-        self.root.after(30, self._draw_frame)
+        try:
+            self.window.after(30, self._draw_frame)
+        except tk.TclError:
+            pass
 
     def on_mouse_wheel(self, event) -> str | None:
         if not self.image_bounds or not event.delta:
@@ -316,15 +367,19 @@ class CameraApp:
     def save_screenshot(self) -> None:
         frame = self._take_latest_frame()
         if frame is None:
-            self.status_text = "尚未收到摄像头画面。"
+            self.status_text = "No camera frame is available yet."
         else:
-            output_path = save_frame(frame)
-            self.status_text = f"已保存：{output_path.name}"
+            output_path = save_frame(frame, self.camera_index)
+            self.status_text = f"Saved: {output_path.name}"
         self.status_until = time.perf_counter() + 3.0
+
+    def set_status(self, text: str, duration: float = 3.0) -> None:
+        self.status_text = text
+        self.status_until = time.perf_counter() + duration
 
     def toggle_fullscreen(self) -> None:
         self.fullscreen = not self.fullscreen
-        self.root.attributes("-fullscreen", self.fullscreen)
+        self.window.attributes("-fullscreen", self.fullscreen)
 
     def on_escape(self, _event) -> None:
         if self.fullscreen:
@@ -332,34 +387,122 @@ class CameraApp:
         else:
             self.close()
 
-    def close(self) -> None:
+    def close(self, notify_manager: bool = True) -> None:
         if not self.running:
             return
         self.running = False
         try:
             self.capture.release()
         finally:
+            try:
+                self.window.destroy()
+            except tk.TclError:
+                pass
+        if notify_manager:
+            self.manager.camera_closed(self)
+
+
+class CameraManager:
+    """Owns the hidden Tk root and all visible camera preview windows."""
+
+    def __init__(
+        self,
+        captures: list[OpenedCapture],
+        width: int,
+        height: int,
+        fps: int,
+        max_index: int,
+    ) -> None:
+        self.width = width
+        self.height = height
+        self.fps = fps
+        self.max_index = max_index
+        self.root = tk.Tk()
+        self.root.withdraw()
+        self.root.protocol("WM_DELETE_WINDOW", self.close_all)
+        self.windows: dict[int, CameraWindow] = {}
+        self.shutting_down = False
+
+        for position, opened in enumerate(captures):
+            self.add_camera(opened, position)
+
+    def add_camera(self, opened: OpenedCapture, position: int | None = None) -> None:
+        if opened.index in self.windows:
+            opened.capture.release()
+            return
+        if position is None:
+            position = len(self.windows)
+        self.windows[opened.index] = CameraWindow(self, opened, position)
+
+    def scan_for_cameras(self) -> None:
+        if self.shutting_down:
+            return
+        known_indices = set(self.windows)
+        added = 0
+        for index in range(self.max_index + 1):
+            if index in known_indices:
+                continue
+            try:
+                opened = open_capture(index, self.width, self.height, self.fps)
+            except RuntimeError:
+                continue
+            self.add_camera(opened)
+            added += 1
+
+        message = "No new cameras found." if not added else f"Added {added} camera(s)."
+        for window in self.windows.values():
+            window.set_status(message)
+
+    def camera_closed(self, window: CameraWindow) -> None:
+        if self.windows.get(window.camera_index) is window:
+            del self.windows[window.camera_index]
+        if not self.windows and not self.shutting_down:
+            self.root.after_idle(self.close_all)
+
+    def close_all(self) -> None:
+        if self.shutting_down:
+            return
+        self.shutting_down = True
+        for window in list(self.windows.values()):
+            window.close(notify_manager=False)
+        self.windows.clear()
+        try:
+            self.root.quit()
             self.root.destroy()
+        except tk.TclError:
+            pass
 
     def run(self) -> None:
         self.root.mainloop()
 
 
-def show_preview(capture: cv2.VideoCapture, camera_index: int) -> int:
-    app = CameraApp(capture, camera_index)
-    app.run()
+def show_previews(
+    captures: list[OpenedCapture], width: int, height: int, fps: int, max_index: int
+) -> int:
+    manager = CameraManager(captures, width, height, fps, max_index)
+    manager.run()
     return 0
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Display a live camera preview.")
-    parser.add_argument("--camera", type=int, default=0, help="Camera index to open (default: 0).")
+    parser = argparse.ArgumentParser(description="Display one or more live camera previews.")
+    parser.add_argument(
+        "--camera",
+        type=int,
+        action="append",
+        help="Camera index to open. Repeat the option to select multiple cameras.",
+    )
+    parser.add_argument(
+        "--all",
+        action="store_true",
+        help="Open every usable camera found up to --max-index.",
+    )
     parser.add_argument("--width", type=int, default=1280, help="Requested frame width.")
     parser.add_argument("--height", type=int, default=720, help="Requested frame height.")
     parser.add_argument("--fps", type=int, default=30, help="Requested frame rate.")
     parser.add_argument("--list", action="store_true", help="List working camera indices and exit.")
-    parser.add_argument("--max-index", type=int, default=8, help="Highest index checked by --list.")
-    parser.add_argument("--self-test", action="store_true", help="Read one frame and exit without opening a window.")
+    parser.add_argument("--max-index", type=int, default=8, help="Highest camera index scanned.")
+    parser.add_argument("--self-test", action="store_true", help="Open selected cameras and exit.")
     return parser.parse_args()
 
 
@@ -367,20 +510,34 @@ def main() -> int:
     args = parse_args()
     if min(args.width, args.height, args.fps) <= 0:
         raise ValueError("Width, height, and fps must be positive.")
+    if args.max_index < 0:
+        raise ValueError("max-index must be zero or greater.")
     if args.list:
         return list_cameras(args.max_index, args.width, args.height, args.fps)
 
-    capture, backend = open_capture(args.camera, args.width, args.height, args.fps)
+    scan_all = args.all or not args.camera
+    indices: Iterable[int] = range(args.max_index + 1) if scan_all else args.camera
+    captures = open_captures(indices, args.width, args.height, args.fps)
+    if not captures:
+        if scan_all:
+            raise RuntimeError("No usable camera was found.")
+        requested = ", ".join(str(index) for index in args.camera)
+        raise RuntimeError(f"Cannot open requested camera(s): {requested}")
+
     try:
-        actual_width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
-        actual_height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        print(f"Camera {args.camera}: {actual_width}x{actual_height} via {backend}")
+        for opened in captures:
+            actual_width = int(opened.capture.get(cv2.CAP_PROP_FRAME_WIDTH))
+            actual_height = int(opened.capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            print(
+                f"Camera {opened.index}: {actual_width}x{actual_height} via {opened.backend}"
+            )
         if args.self_test:
             print("Camera self-test passed.")
             return 0
-        return show_preview(capture, args.camera)
+        return show_previews(captures, args.width, args.height, args.fps, args.max_index)
     finally:
-        capture.release()
+        for opened in captures:
+            opened.capture.release()
 
 
 if __name__ == "__main__":
