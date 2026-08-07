@@ -11,10 +11,10 @@ dist/
 
 # User-generated files
 screenshots/
+camera_preview_settings.json
 
 # Local editor and operating-system files
 .vscode/
 .idea/
 Thumbs.db
 Desktop.ini
-
