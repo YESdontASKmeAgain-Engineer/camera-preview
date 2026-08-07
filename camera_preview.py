@@ -267,8 +267,9 @@ class CameraApp:
 
     @staticmethod
     def _to_photo(frame):
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        ok, encoded = cv2.imencode(".png", rgb, [cv2.IMWRITE_PNG_COMPRESSION, 1])
+        # OpenCV's PNG encoder converts its BGR frame to the PNG RGB order.
+        # Converting here first would swap red and blue twice.
+        ok, encoded = cv2.imencode(".png", frame, [cv2.IMWRITE_PNG_COMPRESSION, 1])
         if not ok:
             raise RuntimeError("Could not encode camera frame for display.")
         encoded_base64 = base64.b64encode(encoded.tobytes()).decode("ascii")
