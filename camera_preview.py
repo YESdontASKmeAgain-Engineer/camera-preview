@@ -286,7 +286,13 @@ def load_hotkey() -> GlobalHotkey:
         hotkey = GlobalHotkey(int(payload["modifiers"]), int(payload["key"]))
     except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
         return DEFAULT_HOTKEY
-    return hotkey if is_valid_hotkey(hotkey) else DEFAULT_HOTKEY
+    if is_valid_hotkey(hotkey):
+        return hotkey
+    try:
+        save_hotkey(DEFAULT_HOTKEY)
+    except OSError:
+        pass
+    return DEFAULT_HOTKEY
 
 
 def save_hotkey(hotkey: GlobalHotkey) -> None:
@@ -689,7 +695,7 @@ class CameraManager:
         container.pack(fill=tk.BOTH, expand=True)
         ttk.Label(
             container,
-            text="\u70b9\u51fb\u8f93\u5165\u6846\uff0c\u7136\u540e\u6309\u4e0b Ctrl \u52a0\u4e00\u4e2a\u6309\u952e\u3002",
+            text="\u76f4\u63a5\u6309\u4e0b Ctrl \u52a0\u4e00\u4e2a\u6309\u952e\uff0c\u7136\u540e\u70b9\u51fb\u5e94\u7528\u3002",
         ).pack(anchor=tk.W)
 
         candidate = [self.hotkey]
@@ -737,8 +743,9 @@ class CameraManager:
         ttk.Button(buttons, text="\u6062\u590d\u9ed8\u8ba4", command=use_default).pack(side=tk.LEFT)
 
         capture.bind("<KeyPress>", capture_shortcut)
+        dialog.bind("<KeyPress>", capture_shortcut)
         dialog.protocol("WM_DELETE_WINDOW", close_dialog)
-        dialog.after_idle(capture.focus_set)
+        dialog.after_idle(dialog.focus_force)
 
     def scan_for_cameras(self) -> None:
         if self.shutting_down:
