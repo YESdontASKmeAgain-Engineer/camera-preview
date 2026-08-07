@@ -10,10 +10,12 @@ from __future__ import annotations
 import argparse
 import base64
 import ctypes
+import queue
 import sys
 import threading
 import time
 import tkinter as tk
+from ctypes import wintypes
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -29,6 +31,13 @@ BACKENDS = (
     ("Media Foundation", cv2.CAP_MSMF),
 )
 MAX_ZOOM = 8.0
+WM_HOTKEY = 0x0312
+WM_QUIT = 0x0012
+HOTKEY_ID = 0xCA01
+MOD_CONTROL = 0x0002
+MOD_SHIFT = 0x0004
+MOD_NOREPEAT = 0x4000
+VK_H = 0x48
 
 
 @dataclass
@@ -422,6 +431,14 @@ class CameraManager:
         self.root.protocol("WM_DELETE_WINDOW", self.close_all)
         self.windows: dict[int, CameraWindow] = {}
         self.shutting_down = False
+        self.previews_hidden = False
+        self._hotkey_events = queue.SimpleQueue()
+        self._hotkey_stop = threading.Event()
+        self._hotkey_thread: threading.Thread | None = None
+        self._hotkey_thread_id: int | None = None
+        self.hotkey_available = False
+        self._start_hotkey_listener()
+        self.root.after(80, self._poll_hotkey_events)
 
         for position, opened in enumerate(captures):
             self.add_camera(opened, position)
@@ -432,7 +449,75 @@ class CameraManager:
             return
         if position is None:
             position = len(self.windows)
-        self.windows[opened.index] = CameraWindow(self, opened, position)
+        window = CameraWindow(self, opened, position)
+        self.windows[opened.index] = window
+        if self.previews_hidden:
+            window.window.withdraw()
+
+    def _start_hotkey_listener(self) -> None:
+        if sys.platform != "win32":
+            return
+        self._hotkey_thread = threading.Thread(
+            target=self._hotkey_loop,
+            name="camera-preview-hotkey",
+            daemon=True,
+        )
+        self._hotkey_thread.start()
+
+    def _hotkey_loop(self) -> None:
+        self._hotkey_thread_id = threading.get_native_id()
+        user32 = ctypes.windll.user32
+        modifiers = MOD_CONTROL | MOD_SHIFT | MOD_NOREPEAT
+        registered = bool(user32.RegisterHotKey(None, HOTKEY_ID, modifiers, VK_H))
+        if not registered:
+            return
+
+        self.hotkey_available = True
+        message = wintypes.MSG()
+        try:
+            while not self._hotkey_stop.is_set():
+                result = user32.GetMessageW(ctypes.byref(message), None, 0, 0)
+                if result <= 0:
+                    break
+                if message.message == WM_HOTKEY:
+                    self._hotkey_events.put(None)
+        finally:
+            user32.UnregisterHotKey(None, HOTKEY_ID)
+            self.hotkey_available = False
+
+    def _poll_hotkey_events(self) -> None:
+        pressed = False
+        while True:
+            try:
+                self._hotkey_events.get_nowait()
+            except queue.Empty:
+                break
+            pressed = True
+        if pressed:
+            self.toggle_visibility()
+        if not self.shutting_down:
+            try:
+                self.root.after(80, self._poll_hotkey_events)
+            except tk.TclError:
+                pass
+
+    def _stop_hotkey_listener(self) -> None:
+        self._hotkey_stop.set()
+        if sys.platform == "win32" and self._hotkey_thread_id is not None:
+            ctypes.windll.user32.PostThreadMessageW(self._hotkey_thread_id, WM_QUIT, 0, 0)
+        if self._hotkey_thread and self._hotkey_thread.is_alive():
+            self._hotkey_thread.join(timeout=1.0)
+
+    def toggle_visibility(self) -> None:
+        if not self.windows:
+            return
+        self.previews_hidden = not self.previews_hidden
+        for window in self.windows.values():
+            if self.previews_hidden:
+                window.window.withdraw()
+            else:
+                window.window.deiconify()
+                window.window.lift()
 
     def scan_for_cameras(self) -> None:
         if self.shutting_down:
@@ -463,6 +548,7 @@ class CameraManager:
         if self.shutting_down:
             return
         self.shutting_down = True
+        self._stop_hotkey_listener()
         for window in list(self.windows.values()):
             window.close(notify_manager=False)
         self.windows.clear()
