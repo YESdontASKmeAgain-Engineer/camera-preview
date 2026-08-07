@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import base64
 import ctypes
+import json
 import queue
 import sys
 import threading
@@ -19,7 +20,7 @@ from ctypes import wintypes
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from tkinter import ttk
+from tkinter import messagebox, ttk
 from typing import Iterable
 
 import cv2
@@ -34,10 +35,51 @@ MAX_ZOOM = 8.0
 WM_HOTKEY = 0x0312
 WM_QUIT = 0x0012
 HOTKEY_ID = 0xCA01
+MOD_ALT = 0x0001
 MOD_CONTROL = 0x0002
 MOD_SHIFT = 0x0004
 MOD_NOREPEAT = 0x4000
 VK_H = 0x48
+DEFAULT_HOTKEY_MODIFIERS = MOD_CONTROL | MOD_SHIFT
+HOTKEY_SETTINGS_FILENAME = "camera_preview_settings.json"
+TK_SHIFT_MASK = 0x0001
+TK_CONTROL_MASK = 0x0004
+TK_ALT_MASK = 0x0008
+
+SPECIAL_KEY_LABELS = {
+    0x08: "Backspace",
+    0x09: "Tab",
+    0x0D: "Enter",
+    0x1B: "Esc",
+    0x20: "Space",
+    0x21: "Page Up",
+    0x22: "Page Down",
+    0x23: "End",
+    0x24: "Home",
+    0x25: "Left",
+    0x26: "Up",
+    0x27: "Right",
+    0x28: "Down",
+    0x2D: "Insert",
+    0x2E: "Delete",
+}
+KEYSYM_TO_VK = {
+    "BackSpace": 0x08,
+    "Tab": 0x09,
+    "Return": 0x0D,
+    "Escape": 0x1B,
+    "space": 0x20,
+    "Prior": 0x21,
+    "Next": 0x22,
+    "Home": 0x24,
+    "End": 0x23,
+    "Left": 0x25,
+    "Up": 0x26,
+    "Right": 0x27,
+    "Down": 0x28,
+    "Insert": 0x2D,
+    "Delete": 0x2E,
+}
 
 
 @dataclass
@@ -102,6 +144,69 @@ class ZoomView:
         if (crop_width, crop_height) == (output_width, output_height):
             return crop
         return cv2.resize(crop, (output_width, output_height), interpolation=cv2.INTER_LINEAR)
+
+
+@dataclass(frozen=True)
+class GlobalHotkey:
+    modifiers: int
+    key: int
+
+    @property
+    def label(self) -> str:
+        parts: list[str] = []
+        if self.modifiers & MOD_CONTROL:
+            parts.append("Ctrl")
+        if self.modifiers & MOD_ALT:
+            parts.append("Alt")
+        if self.modifiers & MOD_SHIFT:
+            parts.append("Shift")
+        parts.append(self.key_label)
+        return " + ".join(parts)
+
+    @property
+    def key_label(self) -> str:
+        if 0x30 <= self.key <= 0x39 or 0x41 <= self.key <= 0x5A:
+            return chr(self.key)
+        if 0x70 <= self.key <= 0x87:
+            return f"F{self.key - 0x70 + 1}"
+        return SPECIAL_KEY_LABELS.get(self.key, f"Key {self.key}")
+
+
+DEFAULT_HOTKEY = GlobalHotkey(DEFAULT_HOTKEY_MODIFIERS, VK_H)
+
+
+def is_valid_hotkey(hotkey: GlobalHotkey) -> bool:
+    allowed_modifiers = MOD_ALT | MOD_CONTROL | MOD_SHIFT
+    return (
+        bool(hotkey.modifiers & (MOD_ALT | MOD_CONTROL))
+        and not hotkey.modifiers & ~allowed_modifiers
+        and 1 <= hotkey.key <= 0xFF
+    )
+
+
+def virtual_key_from_keysym(keysym: str) -> int | None:
+    if len(keysym) == 1 and keysym.isascii() and keysym.isalnum():
+        return ord(keysym.upper())
+    if keysym.startswith("F") and keysym[1:].isdigit():
+        number = int(keysym[1:])
+        if 1 <= number <= 24:
+            return 0x70 + number - 1
+    return KEYSYM_TO_VK.get(keysym)
+
+
+def hotkey_from_event(event) -> GlobalHotkey | None:
+    key = virtual_key_from_keysym(event.keysym)
+    if key is None:
+        return None
+    modifiers = 0
+    if event.state & TK_CONTROL_MASK:
+        modifiers |= MOD_CONTROL
+    if event.state & TK_ALT_MASK:
+        modifiers |= MOD_ALT
+    if event.state & TK_SHIFT_MASK:
+        modifiers |= MOD_SHIFT
+    hotkey = GlobalHotkey(modifiers, key)
+    return hotkey if is_valid_hotkey(hotkey) else None
 
 
 @dataclass
@@ -174,6 +279,26 @@ def application_directory() -> Path:
     if getattr(sys, "frozen", False):
         return Path(sys.executable).resolve().parent
     return Path(__file__).resolve().parent
+
+
+def hotkey_settings_path() -> Path:
+    return application_directory() / HOTKEY_SETTINGS_FILENAME
+
+
+def load_hotkey() -> GlobalHotkey:
+    try:
+        payload = json.loads(hotkey_settings_path().read_text(encoding="utf-8"))
+        hotkey = GlobalHotkey(int(payload["modifiers"]), int(payload["key"]))
+    except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+        return DEFAULT_HOTKEY
+    return hotkey if is_valid_hotkey(hotkey) else DEFAULT_HOTKEY
+
+
+def save_hotkey(hotkey: GlobalHotkey) -> None:
+    payload = {"modifiers": hotkey.modifiers, "key": hotkey.key}
+    hotkey_settings_path().write_text(
+        json.dumps(payload, indent=2) + "\n", encoding="utf-8"
+    )
 
 
 def save_frame(frame, camera_index: int) -> Path:
@@ -254,6 +379,11 @@ class CameraWindow:
         ttk.Button(toolbar, text="\u626b\u63cf", command=self.manager.scan_for_cameras).pack(
             side=tk.RIGHT, padx=(0, 6)
         )
+        ttk.Button(
+            toolbar,
+            text="\u5feb\u6377\u952e",
+            command=lambda: self.manager.open_hotkey_dialog(self.window),
+        ).pack(side=tk.RIGHT, padx=(0, 6))
 
         self.canvas = tk.Canvas(self.window, background="#101010", highlightthickness=0)
         self.canvas.pack(fill=tk.BOTH, expand=True)
@@ -432,8 +562,10 @@ class CameraManager:
         self.windows: dict[int, CameraWindow] = {}
         self.shutting_down = False
         self.previews_hidden = False
+        self.hotkey = load_hotkey()
         self._hotkey_events = queue.SimpleQueue()
         self._hotkey_stop = threading.Event()
+        self._hotkey_ready = threading.Event()
         self._hotkey_thread: threading.Thread | None = None
         self._hotkey_thread_id: int | None = None
         self.hotkey_available = False
@@ -457,6 +589,10 @@ class CameraManager:
     def _start_hotkey_listener(self) -> None:
         if sys.platform != "win32":
             return
+        self._hotkey_stop.clear()
+        self._hotkey_ready = threading.Event()
+        self._hotkey_thread_id = None
+        self.hotkey_available = False
         self._hotkey_thread = threading.Thread(
             target=self._hotkey_loop,
             name="camera-preview-hotkey",
@@ -467,12 +603,14 @@ class CameraManager:
     def _hotkey_loop(self) -> None:
         self._hotkey_thread_id = threading.get_native_id()
         user32 = ctypes.windll.user32
-        modifiers = MOD_CONTROL | MOD_SHIFT | MOD_NOREPEAT
-        registered = bool(user32.RegisterHotKey(None, HOTKEY_ID, modifiers, VK_H))
+        hotkey = self.hotkey
+        modifiers = hotkey.modifiers | MOD_NOREPEAT
+        registered = bool(user32.RegisterHotKey(None, HOTKEY_ID, modifiers, hotkey.key))
+        self.hotkey_available = registered
+        self._hotkey_ready.set()
         if not registered:
             return
 
-        self.hotkey_available = True
         message = wintypes.MSG()
         try:
             while not self._hotkey_stop.is_set():
@@ -507,6 +645,9 @@ class CameraManager:
             ctypes.windll.user32.PostThreadMessageW(self._hotkey_thread_id, WM_QUIT, 0, 0)
         if self._hotkey_thread and self._hotkey_thread.is_alive():
             self._hotkey_thread.join(timeout=1.0)
+        self._hotkey_thread = None
+        self._hotkey_thread_id = None
+        self.hotkey_available = False
 
     def toggle_visibility(self) -> None:
         if not self.windows:
@@ -518,6 +659,91 @@ class CameraManager:
             else:
                 window.window.deiconify()
                 window.window.lift()
+
+    def set_hotkey(self, hotkey: GlobalHotkey) -> bool:
+        if not is_valid_hotkey(hotkey):
+            return False
+        if hotkey == self.hotkey:
+            return self.hotkey_available
+
+        previous_hotkey = self.hotkey
+        self._stop_hotkey_listener()
+        self.hotkey = hotkey
+        self._start_hotkey_listener()
+        self._hotkey_ready.wait(timeout=1.0)
+        if self.hotkey_available:
+            save_hotkey(hotkey)
+            for window in self.windows.values():
+                window.set_status(f"Hotkey: {hotkey.label}")
+            return True
+
+        self._stop_hotkey_listener()
+        self.hotkey = previous_hotkey
+        self._start_hotkey_listener()
+        self._hotkey_ready.wait(timeout=1.0)
+        return False
+
+    def open_hotkey_dialog(self, parent) -> None:
+        dialog = tk.Toplevel(parent)
+        dialog.title("\u8bbe\u7f6e\u5168\u5c40\u5feb\u6377\u952e")
+        dialog.transient(parent)
+        dialog.resizable(False, False)
+        dialog.grab_set()
+
+        container = ttk.Frame(dialog, padding=16)
+        container.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(
+            container,
+            text="\u70b9\u51fb\u8f93\u5165\u6846\uff0c\u7136\u540e\u6309\u4e0b\u65b0\u7ec4\u5408\u952e\u3002\u5fc5\u987b\u5305\u542b Ctrl \u6216 Alt\u3002",
+        ).pack(anchor=tk.W)
+
+        candidate = [self.hotkey]
+        shortcut_text = tk.StringVar(value=candidate[0].label)
+        capture = ttk.Entry(container, textvariable=shortcut_text, state="readonly", width=30)
+        capture.pack(fill=tk.X, pady=(10, 12))
+
+        def capture_shortcut(event) -> str:
+            hotkey = hotkey_from_event(event)
+            if hotkey is not None:
+                candidate[0] = hotkey
+                shortcut_text.set(hotkey.label)
+            return "break"
+
+        def use_default() -> None:
+            candidate[0] = DEFAULT_HOTKEY
+            shortcut_text.set(DEFAULT_HOTKEY.label)
+
+        def close_dialog() -> None:
+            try:
+                dialog.grab_release()
+                dialog.destroy()
+            except tk.TclError:
+                pass
+
+        def apply_hotkey() -> None:
+            try:
+                changed = self.set_hotkey(candidate[0])
+            except OSError as error:
+                messagebox.showerror(WINDOW_TITLE, str(error), parent=dialog)
+                return
+            if changed:
+                close_dialog()
+                return
+            messagebox.showerror(
+                WINDOW_TITLE,
+                f"{candidate[0].label} is unavailable. Choose another shortcut.",
+                parent=dialog,
+            )
+
+        buttons = ttk.Frame(container)
+        buttons.pack(fill=tk.X)
+        ttk.Button(buttons, text="\u5e94\u7528", command=apply_hotkey).pack(side=tk.RIGHT)
+        ttk.Button(buttons, text="\u53d6\u6d88", command=close_dialog).pack(side=tk.RIGHT, padx=(0, 6))
+        ttk.Button(buttons, text="\u6062\u590d\u9ed8\u8ba4", command=use_default).pack(side=tk.LEFT)
+
+        capture.bind("<KeyPress>", capture_shortcut)
+        dialog.protocol("WM_DELETE_WINDOW", close_dialog)
+        dialog.after_idle(capture.focus_set)
 
     def scan_for_cameras(self) -> None:
         if self.shutting_down:
