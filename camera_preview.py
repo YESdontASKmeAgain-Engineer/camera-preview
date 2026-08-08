@@ -45,8 +45,12 @@ BACKENDS = (
 )
 MAX_ZOOM = 8.0
 DISPLAY_INTERVAL_MS = 50
-MULTI_CAMERA_FPS = 15
-MULTI_CAMERA_DISPLAY_INTERVAL_MS = 100
+DEFAULT_CAPTURE_FOURCC = "MJPG"
+MULTI_CAMERA_WIDTH = 640
+MULTI_CAMERA_HEIGHT = 480
+MULTI_CAMERA_FPS = 30
+MULTI_CAMERA_FOURCC = "YUY2"
+MULTI_CAMERA_DISPLAY_INTERVAL_MS = 33
 DEFAULT_MAIN_WINDOW_WIDTH = 1280
 DEFAULT_MAIN_WINDOW_HEIGHT = 800
 DEFAULT_PANEL_WIDTH = 600
@@ -704,22 +708,34 @@ def open_network_capture(stream_url: str) -> OpenedCapture:
     raise RuntimeError("Could not open the network camera stream.")
 
 
-def configure_capture(capture: cv2.VideoCapture, width: int, height: int, fps: int) -> None:
-    capture.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+def configure_capture(
+    capture: cv2.VideoCapture,
+    width: int,
+    height: int,
+    fps: int,
+    fourcc: str = DEFAULT_CAPTURE_FOURCC,
+) -> None:
+    capture.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*fourcc))
     capture.set(cv2.CAP_PROP_FRAME_WIDTH, width)
     capture.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
     capture.set(cv2.CAP_PROP_FPS, fps)
     capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
 
-def open_capture(index: int, width: int, height: int, fps: int) -> OpenedCapture:
+def open_capture(
+    index: int,
+    width: int,
+    height: int,
+    fps: int,
+    fourcc: str = DEFAULT_CAPTURE_FOURCC,
+) -> OpenedCapture:
     for backend_name, backend_id in BACKENDS:
         capture = cv2.VideoCapture(index, backend_id)
         if not capture.isOpened():
             capture.release()
             continue
 
-        configure_capture(capture, width, height, fps)
+        configure_capture(capture, width, height, fps, fourcc)
         ok, _ = capture.read()
         if ok:
             return OpenedCapture(index=index, capture=capture, backend=backend_name)
@@ -729,7 +745,11 @@ def open_capture(index: int, width: int, height: int, fps: int) -> OpenedCapture
 
 
 def open_captures(
-    indices: Iterable[int], width: int, height: int, fps: int
+    indices: Iterable[int],
+    width: int,
+    height: int,
+    fps: int,
+    fourcc: str = DEFAULT_CAPTURE_FOURCC,
 ) -> list[OpenedCapture]:
     captures: list[OpenedCapture] = []
     opened_indices: set[int] = set()
@@ -737,7 +757,7 @@ def open_captures(
         if index < 0 or index in opened_indices:
             continue
         try:
-            opened = open_capture(index, width, height, fps)
+            opened = open_capture(index, width, height, fps, fourcc)
         except RuntimeError:
             continue
         captures.append(opened)
@@ -1309,11 +1329,13 @@ class CameraManager:
         height: int,
         fps: int,
         max_index: int,
+        capture_fourcc: str = DEFAULT_CAPTURE_FOURCC,
     ) -> None:
         self.width = width
         self.height = height
         self.fps = fps
         self.max_index = max_index
+        self.capture_fourcc = capture_fourcc
         self.root = tk.Tk()
         self.root.withdraw()
         self.root.protocol("WM_DELETE_WINDOW", self.close_all)
@@ -1591,6 +1613,22 @@ class CameraManager:
         frame_interval = 1.0 / max(1, target_fps)
         for window in self.windows.values():
             window.frame_interval = frame_interval
+
+    def _switch_local_captures_to_multi_profile(self) -> None:
+        self.width = min(self.width, MULTI_CAMERA_WIDTH)
+        self.height = min(self.height, MULTI_CAMERA_HEIGHT)
+        self.fps = min(self.fps, MULTI_CAMERA_FPS)
+        self.capture_fourcc = MULTI_CAMERA_FOURCC
+        for panel in self.windows.values():
+            if isinstance(panel.camera_index, int):
+                configure_capture(
+                    panel.capture,
+                    self.width,
+                    self.height,
+                    self.fps,
+                    self.capture_fourcc,
+                )
+        self._apply_capture_performance_profile()
 
     def remember_panel_placement(self, panel: CameraPanel) -> None:
         try:
@@ -2131,16 +2169,29 @@ class CameraManager:
         if self.shutting_down:
             return
         known_indices = set(self.windows)
+        local_camera_count = sum(
+            isinstance(camera_index, int) for camera_index in known_indices
+        )
         added = 0
         for index in range(self.max_index + 1):
             if index in known_indices:
                 continue
+            use_multi_profile = local_camera_count >= 1
+            width = min(self.width, MULTI_CAMERA_WIDTH) if use_multi_profile else self.width
+            height = (
+                min(self.height, MULTI_CAMERA_HEIGHT) if use_multi_profile else self.height
+            )
+            fps = min(self.fps, MULTI_CAMERA_FPS) if use_multi_profile else self.fps
+            fourcc = MULTI_CAMERA_FOURCC if use_multi_profile else self.capture_fourcc
             try:
-                opened = open_capture(index, self.width, self.height, self.fps)
+                opened = open_capture(index, width, height, fps, fourcc)
             except RuntimeError:
                 continue
-            self.add_camera(opened)
-            added += 1
+            if self.add_camera(opened):
+                local_camera_count += 1
+                if local_camera_count > 1:
+                    self._switch_local_captures_to_multi_profile()
+                added += 1
 
         message = "No new cameras found." if not added else f"Added {added} camera(s)."
         for window in self.windows.values():
@@ -2204,9 +2255,14 @@ class CameraManager:
 
 
 def show_previews(
-    captures: list[OpenedCapture], width: int, height: int, fps: int, max_index: int
+    captures: list[OpenedCapture],
+    width: int,
+    height: int,
+    fps: int,
+    max_index: int,
+    capture_fourcc: str = DEFAULT_CAPTURE_FOURCC,
 ) -> int:
-    manager = CameraManager(captures, width, height, fps, max_index)
+    manager = CameraManager(captures, width, height, fps, max_index, capture_fourcc)
     manager.run()
     return 0
 
@@ -2244,40 +2300,84 @@ def main() -> int:
 
     scan_all = args.all or not args.camera
     indices: Iterable[int] = range(args.max_index + 1) if scan_all else args.camera
-    captures = open_captures(indices, args.width, args.height, args.fps)
+    capture_width = args.width
+    capture_height = args.height
+    capture_fps = args.fps
+    capture_fourcc = DEFAULT_CAPTURE_FOURCC
+    captures = open_captures(
+        indices,
+        capture_width,
+        capture_height,
+        capture_fps,
+        capture_fourcc,
+    )
     if not captures:
         if not scan_all:
             requested = ", ".join(str(index) for index in args.camera)
             raise RuntimeError(f"Cannot open requested camera(s): {requested}")
         if args.self_test:
             raise RuntimeError("No usable camera was found.")
-        return show_previews([], args.width, args.height, args.fps, args.max_index)
+        return show_previews(
+            [],
+            capture_width,
+            capture_height,
+            capture_fps,
+            args.max_index,
+            capture_fourcc,
+        )
 
-    if len(captures) > 1 and args.fps > MULTI_CAMERA_FPS:
+    if len(captures) > 1:
         expected_count = len(captures)
         for opened in captures:
             opened.capture.release()
         time.sleep(0.2)
+        capture_width = min(args.width, MULTI_CAMERA_WIDTH)
+        capture_height = min(args.height, MULTI_CAMERA_HEIGHT)
+        capture_fps = min(args.fps, MULTI_CAMERA_FPS)
+        capture_fourcc = MULTI_CAMERA_FOURCC
         captures = open_captures(
-            indices, args.width, args.height, MULTI_CAMERA_FPS
+            indices,
+            capture_width,
+            capture_height,
+            capture_fps,
+            capture_fourcc,
         )
         if len(captures) < expected_count:
             for opened in captures:
                 opened.capture.release()
             time.sleep(0.2)
-            captures = open_captures(indices, args.width, args.height, args.fps)
+            capture_width = args.width
+            capture_height = args.height
+            capture_fps = args.fps
+            capture_fourcc = DEFAULT_CAPTURE_FOURCC
+            captures = open_captures(
+                indices,
+                capture_width,
+                capture_height,
+                capture_fps,
+                capture_fourcc,
+            )
 
     try:
         for opened in captures:
             actual_width = int(opened.capture.get(cv2.CAP_PROP_FRAME_WIDTH))
             actual_height = int(opened.capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            actual_fps = opened.capture.get(cv2.CAP_PROP_FPS)
             print(
-                f"Camera {opened.index}: {actual_width}x{actual_height} via {opened.backend}"
+                f"Camera {opened.index}: {actual_width}x{actual_height} "
+                f"@ {actual_fps:.1f} FPS {capture_fourcc} via {opened.backend}"
             )
         if args.self_test:
             print("Camera self-test passed.")
             return 0
-        return show_previews(captures, args.width, args.height, args.fps, args.max_index)
+        return show_previews(
+            captures,
+            capture_width,
+            capture_height,
+            capture_fps,
+            args.max_index,
+            capture_fourcc,
+        )
     finally:
         for opened in captures:
             opened.capture.release()
