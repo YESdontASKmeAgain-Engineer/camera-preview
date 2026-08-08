@@ -5,6 +5,7 @@ A lightweight Windows desktop application for viewing UVC and ONVIF camera feeds
 ## Features
 
 - Simultaneous previews for all connected Windows UVC cameras in one shared window
+- Two local USB cameras automatically use uncompressed `YUY2` at `640x480 @ 30 FPS` for smooth dual preview
 - Drag each camera panel by its top bar to arrange feeds anywhere in the workspace
 - Restores the main window location and each camera panel location after reopening
 - Always-on-top mode keeps the preview visible while switching applications
