@@ -1,9 +1,4 @@
-"""Display one or more Windows UVC cameras in movable desktop windows.
-
-Each detected camera receives its own standard Windows window. Move a preview
-by dragging its title bar. The mouse wheel zooms around the cursor inside an
-individual preview.
-"""
+"""Display local and network camera feeds in one movable-preview workspace."""
 
 from __future__ import annotations
 
@@ -52,6 +47,12 @@ MAX_ZOOM = 8.0
 DISPLAY_INTERVAL_MS = 50
 MULTI_CAMERA_FPS = 15
 MULTI_CAMERA_DISPLAY_INTERVAL_MS = 100
+DEFAULT_MAIN_WINDOW_WIDTH = 1280
+DEFAULT_MAIN_WINDOW_HEIGHT = 800
+DEFAULT_PANEL_WIDTH = 600
+DEFAULT_PANEL_HEIGHT = 420
+PANEL_PLACEMENTS_KEY = "panel_positions"
+MAIN_WINDOW_PLACEMENT_KEY = "main_window_position"
 WM_HOTKEY = 0x0312
 WM_QUIT = 0x0012
 HOTKEY_ID = 0xCA01
@@ -230,7 +231,7 @@ WS_NONCE_BASE64_TYPE = (
 
 @dataclass(frozen=True)
 class WindowPlacement:
-    """The last known window bounds for one camera index."""
+    """Saved bounds for a top-level window or a camera preview panel."""
 
     x: int
     y: int
@@ -822,9 +823,9 @@ def _camera_source_key(camera_index: int | str) -> int | str | None:
     return camera_index
 
 
-def load_window_placements() -> dict[int | str, WindowPlacement]:
+def _load_camera_placements(settings_key: str) -> dict[int | str, WindowPlacement]:
     payload = load_settings_payload()
-    raw_placements = payload.get("window_positions")
+    raw_placements = payload.get(settings_key)
     if not isinstance(raw_placements, dict):
         return {}
 
@@ -839,15 +840,61 @@ def load_window_placements() -> dict[int | str, WindowPlacement]:
     return placements
 
 
-def save_window_placement(camera_index: int | str, placement: WindowPlacement) -> None:
+def _save_camera_placement(
+    settings_key: str, camera_index: int | str, placement: WindowPlacement
+) -> None:
     source_key = _camera_source_key(camera_index)
     if source_key is None:
         return
     payload = load_settings_payload()
-    raw_placements = payload.get("window_positions")
+    raw_placements = payload.get(settings_key)
     placements = dict(raw_placements) if isinstance(raw_placements, dict) else {}
     placements[str(source_key)] = placement.to_payload()
-    payload["window_positions"] = placements
+    payload[settings_key] = placements
+    save_settings_payload(payload)
+
+
+def load_window_placements() -> dict[int | str, WindowPlacement]:
+    """Load legacy per-window bounds retained for compatibility."""
+    return _load_camera_placements("window_positions")
+
+
+def save_window_placement(camera_index: int | str, placement: WindowPlacement) -> None:
+    """Save legacy per-window bounds retained for compatibility."""
+    _save_camera_placement("window_positions", camera_index, placement)
+
+
+def load_panel_placements() -> dict[int | str, WindowPlacement]:
+    return _load_camera_placements(PANEL_PLACEMENTS_KEY)
+
+
+def save_panel_placement(camera_index: int | str, placement: WindowPlacement) -> None:
+    _save_camera_placement(PANEL_PLACEMENTS_KEY, camera_index, placement)
+
+
+def load_main_window_placement() -> WindowPlacement | None:
+    placement = WindowPlacement.from_payload(
+        load_settings_payload().get(MAIN_WINDOW_PLACEMENT_KEY)
+    )
+    if placement is not None:
+        return placement
+
+    # Preserve the screen location from the former one-window-per-camera layout.
+    legacy_placements = load_window_placements()
+    legacy = next(iter(legacy_placements.values()), None)
+    if legacy is None:
+        return None
+    return WindowPlacement(
+        x=legacy.x,
+        y=legacy.y,
+        width=DEFAULT_MAIN_WINDOW_WIDTH,
+        height=DEFAULT_MAIN_WINDOW_HEIGHT,
+    )
+
+
+def save_main_window_placement(placement: WindowPlacement) -> None:
+    payload = load_settings_payload()
+    payload[MAIN_WINDOW_PLACEMENT_KEY] = placement.to_payload()
     save_settings_payload(payload)
 
 
@@ -862,8 +909,8 @@ def save_frame(frame, camera_index: int | str) -> Path:
     return output_path
 
 
-class CameraWindow:
-    """A movable preview window for one camera capture."""
+class CameraPanel:
+    """One camera feed rendered as a draggable panel in the shared workspace."""
 
     def __init__(
         self,
@@ -878,15 +925,13 @@ class CameraWindow:
         self.backend = opened.backend
         self.camera_name = opened.display_name or f"\u6444\u50cf\u5934 {self.camera_index}"
         self.frame_interval = 1.0 / max(1, min(manager.fps, 30))
-        self.window = tk.Toplevel(manager.root)
-        self.window.title(f"{WINDOW_TITLE} - {self.camera_name}")
-        self.window.minsize(MIN_WINDOW_WIDTH, MIN_WINDOW_HEIGHT)
-        self.window.geometry(self._initial_geometry(position, saved_placement))
-        self.window.protocol("WM_DELETE_WINDOW", self.close)
+        self.window = manager.preview_window
+        self.workspace = manager.workspace
+        if self.window is None or self.workspace is None:
+            raise RuntimeError("Preview workspace is not ready.")
 
         self.zoom_view = ZoomView()
         self.running = True
-        self.fullscreen = False
         self.frame_lock = threading.Lock()
         self.latest_frame = None
         self.frame_count = 0
@@ -896,9 +941,23 @@ class CameraWindow:
         self.status_until = 0.0
         self.image_photo = None
         self.image_bounds: tuple[int, int, int, int] | None = None
-
-        self._build_ui()
+        self._drag_offset: tuple[int, int] | None = None
         self._draw_after_id: str | None = None
+
+        placement = self._initial_placement(position, saved_placement)
+        self.panel = tk.Frame(
+            self.workspace,
+            background="#15191f",
+            highlightbackground="#536171",
+            highlightthickness=1,
+        )
+        self.panel.place(
+            x=placement.x,
+            y=placement.y,
+            width=placement.width,
+            height=placement.height,
+        )
+        self._build_ui()
         self.reader = threading.Thread(
             target=self._read_frames,
             name=f"camera-reader-{self.camera_index}",
@@ -910,27 +969,27 @@ class CameraWindow:
         )
 
     @staticmethod
-    def _initial_geometry(
+    def _initial_placement(
         position: int, saved_placement: WindowPlacement | None = None
-    ) -> str:
+    ) -> WindowPlacement:
         if saved_placement is not None:
-            return (
-                f"{saved_placement.width}x{saved_placement.height}"
-                f"+{saved_placement.x}+{saved_placement.y}"
-            )
-        column = position % 3
-        row = position // 3
-        left = 40 + column * 55
-        top = 40 + row * 55
-        return f"900x620+{left}+{top}"
+            return saved_placement
+        column = position % 2
+        row = position // 2
+        return WindowPlacement(
+            x=16 + column * (DEFAULT_PANEL_WIDTH + 16),
+            y=16 + row * (DEFAULT_PANEL_HEIGHT + 16),
+            width=DEFAULT_PANEL_WIDTH,
+            height=DEFAULT_PANEL_HEIGHT,
+        )
 
     def current_placement(self) -> WindowPlacement:
         self.window.update_idletasks()
         return WindowPlacement(
-            x=self.window.winfo_x(),
-            y=self.window.winfo_y(),
-            width=self.window.winfo_width(),
-            height=self.window.winfo_height(),
+            x=self.panel.winfo_x(),
+            y=self.panel.winfo_y(),
+            width=self.panel.winfo_width(),
+            height=self.panel.winfo_height(),
         )
 
     def _display_interval_ms(self) -> int:
@@ -938,37 +997,59 @@ class CameraWindow:
             return MULTI_CAMERA_DISPLAY_INTERVAL_MS
         return DISPLAY_INTERVAL_MS
 
+    def _bind_drag_handle(self, widget) -> None:
+        widget.bind("<ButtonPress-1>", self._begin_drag, add="+")
+        widget.bind("<B1-Motion>", self._drag_panel, add="+")
+        widget.bind("<ButtonRelease-1>", self._finish_drag, add="+")
+
     def _build_ui(self) -> None:
-        toolbar = ttk.Frame(self.window, padding=(8, 6))
-        toolbar.pack(fill=tk.X)
-        ttk.Label(toolbar, text=self.camera_name).pack(side=tk.LEFT)
-        self.zoom_label = ttk.Label(toolbar, text="\u7f29\u653e x1.0")
-        self.zoom_label.pack(side=tk.LEFT, padx=(14, 0))
-        self.fps_label = ttk.Label(toolbar, text="0.0 FPS")
-        self.fps_label.pack(side=tk.LEFT, padx=(14, 0))
+        header = tk.Frame(self.panel, background="#252d38", height=34)
+        header.pack(fill=tk.X)
+        header.pack_propagate(False)
+        self.header = header
 
-        ttk.Button(toolbar, text="\u91cd\u7f6e", command=self.reset_zoom).pack(side=tk.RIGHT)
-        ttk.Button(toolbar, text="\u5168\u5c4f", command=self.toggle_fullscreen).pack(
-            side=tk.RIGHT, padx=(0, 6)
+        display_name = self.camera_name
+        if len(display_name) > 28:
+            display_name = f"{display_name[:25]}..."
+        name_label = tk.Label(
+            header,
+            background="#252d38",
+            foreground="#f1f5f9",
+            text=display_name,
+            anchor=tk.W,
         )
-        ttk.Button(toolbar, text="\u4fdd\u5b58", command=self.save_screenshot).pack(
-            side=tk.RIGHT, padx=(0, 6)
+        name_label.pack(side=tk.LEFT, padx=(8, 0))
+        self.zoom_label = tk.Label(
+            header,
+            background="#252d38",
+            foreground="#cbd5e1",
+            text="\u7f29\u653e x1.0",
         )
-        ttk.Button(toolbar, text="\u626b\u63cf", command=self.manager.scan_for_cameras).pack(
-            side=tk.RIGHT, padx=(0, 6)
+        self.zoom_label.pack(side=tk.LEFT, padx=(12, 0))
+        self.fps_label = tk.Label(
+            header,
+            background="#252d38",
+            foreground="#cbd5e1",
+            text="0.0 FPS",
         )
-        ttk.Button(
-            toolbar,
-            text="\u7f51\u7edc",
-            command=lambda: self.manager.open_network_camera_dialog(self.window),
-        ).pack(side=tk.RIGHT, padx=(0, 6))
-        ttk.Button(
-            toolbar,
-            text="\u5feb\u6377\u952e",
-            command=lambda: self.manager.open_hotkey_dialog(self.window),
-        ).pack(side=tk.RIGHT, padx=(0, 6))
+        self.fps_label.pack(side=tk.LEFT, padx=(12, 0))
 
-        self.canvas = tk.Canvas(self.window, background="#101010", highlightthickness=0)
+        ttk.Button(header, text="X", width=3, command=self.close).pack(
+            side=tk.RIGHT, padx=(0, 5), pady=3
+        )
+        ttk.Button(header, text="\u4fdd\u5b58", command=self.save_screenshot).pack(
+            side=tk.RIGHT, padx=(0, 5), pady=3
+        )
+        ttk.Button(header, text="\u91cd\u7f6e", command=self.reset_zoom).pack(
+            side=tk.RIGHT, padx=(0, 5), pady=3
+        )
+
+        self.canvas = tk.Canvas(
+            self.panel,
+            background="#101010",
+            highlightthickness=0,
+            takefocus=True,
+        )
         self.canvas.pack(fill=tk.BOTH, expand=True)
         self.image_id = self.canvas.create_image(0, 0, anchor=tk.NW)
         self.message_id = self.canvas.create_text(
@@ -980,18 +1061,50 @@ class CameraWindow:
             text="Opening camera...",
         )
 
+        for widget in (header, name_label, self.zoom_label, self.fps_label):
+            self._bind_drag_handle(widget)
+        self.panel.bind("<ButtonPress-1>", self._activate_panel, add="+")
+        self.canvas.bind("<ButtonPress-1>", self._activate_panel, add="+")
         self.canvas.bind("<MouseWheel>", self.on_mouse_wheel)
-        self.window.bind("<MouseWheel>", self.on_mouse_wheel)
-        self.window.bind("<Key-r>", lambda _event: self.reset_zoom())
-        self.window.bind("<Key-R>", lambda _event: self.reset_zoom())
-        self.window.bind("<Key-s>", lambda _event: self.save_screenshot())
-        self.window.bind("<Key-S>", lambda _event: self.save_screenshot())
-        self.window.bind("<Key-f>", lambda _event: self.toggle_fullscreen())
-        self.window.bind("<Key-F>", lambda _event: self.toggle_fullscreen())
-        self.window.bind("<F11>", lambda _event: self.toggle_fullscreen())
-        self.window.bind("<Key-q>", lambda _event: self.close())
-        self.window.bind("<Key-Q>", lambda _event: self.close())
-        self.window.bind("<Escape>", self.on_escape)
+
+    def _activate_panel(self, _event=None) -> None:
+        self.manager.activate_panel(self)
+
+    def _begin_drag(self, event) -> str:
+        self.manager.activate_panel(self)
+        self._drag_offset = (
+            event.x_root - self.panel.winfo_rootx(),
+            event.y_root - self.panel.winfo_rooty(),
+        )
+        return "break"
+
+    def _drag_panel(self, event) -> str:
+        if self._drag_offset is None:
+            return "break"
+        offset_x, offset_y = self._drag_offset
+        x = event.x_root - self.workspace.winfo_rootx() - offset_x
+        y = event.y_root - self.workspace.winfo_rooty() - offset_y
+        self._place_panel(x, y)
+        return "break"
+
+    def _finish_drag(self, _event) -> str:
+        if self._drag_offset is not None:
+            self._drag_offset = None
+            self.manager.remember_panel_placement(self)
+        return "break"
+
+    def _place_panel(self, x: int, y: int) -> None:
+        self.workspace.update_idletasks()
+        panel_width = max(1, self.panel.winfo_width())
+        panel_height = max(1, self.panel.winfo_height())
+        visible_header_width = min(120, panel_width)
+        visible_header_height = min(34, panel_height)
+        max_x = max(0, self.workspace.winfo_width() - visible_header_width)
+        max_y = max(0, self.workspace.winfo_height() - visible_header_height)
+        self.panel.place_configure(
+            x=min(max(round(x), 0), max_x),
+            y=min(max(round(y), 0), max_y),
+        )
 
     def _read_frames(self) -> None:
         failed_reads = 0
@@ -1042,8 +1155,10 @@ class CameraWindow:
 
     @staticmethod
     def _to_image(frame) -> Image.Image:
-        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        return Image.fromarray(rgb_frame)
+        if not frame.flags["C_CONTIGUOUS"]:
+            frame = frame.copy()
+        height, width = frame.shape[:2]
+        return Image.frombuffer("RGB", (width, height), frame, "raw", "BGR", 0, 1)
 
     @classmethod
     def _to_photo(cls, frame, master=None):
@@ -1120,14 +1235,10 @@ class CameraWindow:
         self.status_until = time.perf_counter() + duration
 
     def toggle_fullscreen(self) -> None:
-        self.fullscreen = not self.fullscreen
-        self.window.attributes("-fullscreen", self.fullscreen)
+        self.manager.toggle_fullscreen()
 
-    def on_escape(self, _event) -> None:
-        if self.fullscreen:
-            self.toggle_fullscreen()
-        else:
-            self.close()
+    def on_escape(self, _event=None) -> None:
+        self.manager.exit_fullscreen_or_close_active()
 
     def close(self, notify_manager: bool = True) -> None:
         if not self.running:
@@ -1139,12 +1250,12 @@ class CameraWindow:
             except tk.TclError:
                 pass
             self._draw_after_id = None
-        self.manager.remember_window_placement(self)
+        self.manager.remember_panel_placement(self)
         try:
             self.capture.release()
         finally:
             try:
-                self.window.destroy()
+                self.panel.destroy()
             except tk.TclError:
                 pass
         if notify_manager:
@@ -1152,7 +1263,7 @@ class CameraWindow:
 
 
 class CameraManager:
-    """Owns the hidden Tk root and all visible camera preview windows."""
+    """Owns one preview window and the camera panels inside its workspace."""
 
     def __init__(
         self,
@@ -1169,8 +1280,13 @@ class CameraManager:
         self.root = tk.Tk()
         self.root.withdraw()
         self.root.protocol("WM_DELETE_WINDOW", self.close_all)
-        self.windows: dict[int | str, CameraWindow] = {}
-        self.window_placements = load_window_placements()
+        self.windows: dict[int | str, CameraPanel] = {}
+        self.panel_placements = load_panel_placements()
+        self.main_window_placement = load_main_window_placement()
+        self.preview_window: tk.Toplevel | None = None
+        self.workspace: tk.Frame | None = None
+        self.active_panel: CameraPanel | None = None
+        self.preview_fullscreen = False
         self._show_launcher_when_empty = not captures
         self.launcher_window: tk.Toplevel | None = None
         self._network_dialog_cleanups: set = set()
@@ -1194,23 +1310,143 @@ class CameraManager:
         if not self.windows:
             self.show_launcher()
 
+    @staticmethod
+    def _geometry_from_placement(placement: WindowPlacement) -> str:
+        return (
+            f"{placement.width}x{placement.height}"
+            f"+{placement.x}+{placement.y}"
+        )
+
+    def ensure_preview_window(self) -> None:
+        if self.preview_window is not None:
+            try:
+                if self.preview_window.winfo_exists():
+                    return
+            except tk.TclError:
+                pass
+            self.preview_window = None
+            self.workspace = None
+
+        window = tk.Toplevel(self.root)
+        self.preview_window = window
+        window.title(WINDOW_TITLE)
+        window.minsize(720, 480)
+        if self.main_window_placement is not None:
+            window.geometry(self._geometry_from_placement(self.main_window_placement))
+        else:
+            window.geometry(
+                f"{DEFAULT_MAIN_WINDOW_WIDTH}x{DEFAULT_MAIN_WINDOW_HEIGHT}+60+60"
+            )
+        window.protocol("WM_DELETE_WINDOW", self.close_all)
+
+        toolbar = ttk.Frame(window, padding=(8, 6))
+        toolbar.pack(fill=tk.X)
+        ttk.Label(toolbar, text=WINDOW_TITLE, font=("Segoe UI", 11)).pack(side=tk.LEFT)
+        ttk.Button(toolbar, text="\u5173\u95ed", command=self.close_all).pack(side=tk.RIGHT)
+        ttk.Button(toolbar, text="\u5168\u5c4f", command=self.toggle_fullscreen).pack(
+            side=tk.RIGHT, padx=(0, 6)
+        )
+        ttk.Button(
+            toolbar,
+            text="\u5feb\u6377\u952e",
+            command=lambda: self.open_hotkey_dialog(window),
+        ).pack(side=tk.RIGHT, padx=(0, 6))
+        ttk.Button(
+            toolbar,
+            text="\u7f51\u7edc",
+            command=lambda: self.open_network_camera_dialog(window),
+        ).pack(side=tk.RIGHT, padx=(0, 6))
+        ttk.Button(toolbar, text="\u626b\u63cf", command=self.scan_for_cameras).pack(
+            side=tk.RIGHT, padx=(0, 6)
+        )
+
+        self.workspace = tk.Frame(window, background="#0f141b", highlightthickness=0)
+        self.workspace.pack(fill=tk.BOTH, expand=True)
+        window.bind("<Key-r>", lambda _event: self._reset_active_panel())
+        window.bind("<Key-R>", lambda _event: self._reset_active_panel())
+        window.bind("<Key-s>", lambda _event: self._save_active_panel())
+        window.bind("<Key-S>", lambda _event: self._save_active_panel())
+        window.bind("<Key-f>", lambda _event: self.toggle_fullscreen())
+        window.bind("<Key-F>", lambda _event: self.toggle_fullscreen())
+        window.bind("<F11>", lambda _event: self.toggle_fullscreen())
+        window.bind("<Key-q>", lambda _event: self._close_active_panel())
+        window.bind("<Key-Q>", lambda _event: self._close_active_panel())
+        window.bind("<Escape>", self.exit_fullscreen_or_close_active)
+
+    def _show_preview_window(self) -> None:
+        self.ensure_preview_window()
+        if self.preview_window is None or self.previews_hidden:
+            return
+        try:
+            self.preview_window.deiconify()
+            self.preview_window.lift()
+        except tk.TclError:
+            pass
+
+    def _hide_preview_window(self) -> None:
+        if self.preview_window is None:
+            return
+        try:
+            if self.preview_window.winfo_exists():
+                self.preview_window.withdraw()
+        except tk.TclError:
+            pass
+
+    def _reset_active_panel(self) -> None:
+        if self.active_panel is not None and self.active_panel.running:
+            self.active_panel.reset_zoom()
+
+    def _save_active_panel(self) -> None:
+        if self.active_panel is not None and self.active_panel.running:
+            self.active_panel.save_screenshot()
+
+    def _close_active_panel(self) -> None:
+        if self.active_panel is not None and self.active_panel.running:
+            self.active_panel.close()
+
+    def activate_panel(self, panel: CameraPanel) -> None:
+        if not panel.running:
+            return
+        self.active_panel = panel
+        try:
+            panel.panel.lift()
+            panel.canvas.focus_set()
+        except tk.TclError:
+            pass
+
+    def toggle_fullscreen(self) -> None:
+        if self.preview_window is None:
+            return
+        self.preview_fullscreen = not self.preview_fullscreen
+        try:
+            self.preview_window.attributes("-fullscreen", self.preview_fullscreen)
+        except tk.TclError:
+            self.preview_fullscreen = False
+
+    def exit_fullscreen_or_close_active(self, _event=None) -> None:
+        if self.preview_fullscreen:
+            self.toggle_fullscreen()
+        else:
+            self._close_active_panel()
+
     def add_camera(self, opened: OpenedCapture, position: int | None = None) -> bool:
         if opened.index in self.windows:
             opened.capture.release()
             return False
         if position is None:
             position = len(self.windows)
-        window = CameraWindow(
+        self.ensure_preview_window()
+        panel = CameraPanel(
             self,
             opened,
             position,
-            self.window_placements.get(opened.index),
+            self.panel_placements.get(opened.index),
         )
-        self.windows[opened.index] = window
+        self.windows[opened.index] = panel
+        self.activate_panel(panel)
         self._apply_capture_performance_profile()
         self.hide_launcher()
-        if self.previews_hidden:
-            window.window.withdraw()
+        self._show_preview_window()
         return True
 
     def _apply_capture_performance_profile(self) -> None:
@@ -1221,15 +1457,35 @@ class CameraManager:
         for window in self.windows.values():
             window.frame_interval = frame_interval
 
-    def remember_window_placement(self, window: CameraWindow) -> None:
+    def remember_panel_placement(self, panel: CameraPanel) -> None:
         try:
-            placement = window.current_placement()
+            placement = panel.current_placement()
         except tk.TclError:
             return
 
-        self.window_placements[window.camera_index] = placement
+        self.panel_placements[panel.camera_index] = placement
         try:
-            save_window_placement(window.camera_index, placement)
+            save_panel_placement(panel.camera_index, placement)
+        except OSError:
+            pass
+
+    def remember_main_window_placement(self) -> None:
+        if self.preview_window is None:
+            return
+        try:
+            self.preview_window.update_idletasks()
+            placement = WindowPlacement(
+                x=self.preview_window.winfo_x(),
+                y=self.preview_window.winfo_y(),
+                width=self.preview_window.winfo_width(),
+                height=self.preview_window.winfo_height(),
+            )
+        except tk.TclError:
+            return
+
+        self.main_window_placement = placement
+        try:
+            save_main_window_placement(placement)
         except OSError:
             pass
 
@@ -1367,12 +1623,10 @@ class CameraManager:
         if not self.windows:
             return
         self.previews_hidden = not self.previews_hidden
-        for window in self.windows.values():
-            if self.previews_hidden:
-                window.window.withdraw()
-            else:
-                window.window.deiconify()
-                window.window.lift()
+        if self.previews_hidden:
+            self._hide_preview_window()
+        else:
+            self._show_preview_window()
 
     def set_hotkey(self, hotkey: GlobalHotkey) -> bool:
         if not is_valid_hotkey(hotkey):
@@ -1757,11 +2011,14 @@ class CameraManager:
         for window in self.windows.values():
             window.set_status(message)
 
-    def camera_closed(self, window: CameraWindow) -> None:
-        if self.windows.get(window.camera_index) is window:
-            del self.windows[window.camera_index]
+    def camera_closed(self, panel: CameraPanel) -> None:
+        if self.windows.get(panel.camera_index) is panel:
+            del self.windows[panel.camera_index]
+        if self.active_panel is panel:
+            self.active_panel = next(iter(self.windows.values()), None)
         self._apply_capture_performance_profile()
         if not self.windows and not self.shutting_down:
+            self._hide_preview_window()
             if self._show_launcher_when_empty:
                 self.show_launcher()
             else:
@@ -1771,6 +2028,7 @@ class CameraManager:
         if self.shutting_down:
             return
         self.shutting_down = True
+        self.remember_main_window_placement()
         for callback_id in (self._hotkey_poll_after_id, self._close_after_id):
             if callback_id is None:
                 continue
@@ -1792,6 +2050,14 @@ class CameraManager:
         for window in list(self.windows.values()):
             window.close(notify_manager=False)
         self.windows.clear()
+        self.active_panel = None
+        if self.preview_window is not None:
+            try:
+                self.preview_window.destroy()
+            except tk.TclError:
+                pass
+            self.preview_window = None
+            self.workspace = None
         try:
             self.root.quit()
             self.root.destroy()
