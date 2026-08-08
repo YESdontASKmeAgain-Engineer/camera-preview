@@ -53,6 +53,7 @@ DEFAULT_PANEL_WIDTH = 600
 DEFAULT_PANEL_HEIGHT = 420
 PANEL_PLACEMENTS_KEY = "panel_positions"
 MAIN_WINDOW_PLACEMENT_KEY = "main_window_position"
+PREVIEW_DISPLAY_OPTIONS_KEY = "preview_display_options"
 WM_HOTKEY = 0x0312
 WM_QUIT = 0x0012
 HOTKEY_ID = 0xCA01
@@ -898,6 +899,29 @@ def save_main_window_placement(placement: WindowPlacement) -> None:
     save_settings_payload(payload)
 
 
+def load_preview_display_options() -> tuple[bool, bool]:
+    payload = load_settings_payload()
+    options = payload.get(PREVIEW_DISPLAY_OPTIONS_KEY)
+    if not isinstance(options, dict):
+        return True, False
+
+    always_on_top = options.get("always_on_top")
+    borderless = options.get("borderless")
+    return (
+        always_on_top if isinstance(always_on_top, bool) else True,
+        borderless if isinstance(borderless, bool) else False,
+    )
+
+
+def save_preview_display_options(always_on_top: bool, borderless: bool) -> None:
+    payload = load_settings_payload()
+    payload[PREVIEW_DISPLAY_OPTIONS_KEY] = {
+        "always_on_top": always_on_top,
+        "borderless": borderless,
+    }
+    save_settings_payload(payload)
+
+
 def save_frame(frame, camera_index: int | str) -> Path:
     screenshot_dir = application_directory() / "screenshots"
     screenshot_dir.mkdir(exist_ok=True)
@@ -943,6 +967,7 @@ class CameraPanel:
         self.image_bounds: tuple[int, int, int, int] | None = None
         self._drag_offset: tuple[int, int] | None = None
         self._draw_after_id: str | None = None
+        self.chrome_visible = True
 
         placement = self._initial_placement(position, saved_placement)
         self.panel = tk.Frame(
@@ -958,6 +983,7 @@ class CameraPanel:
             height=placement.height,
         )
         self._build_ui()
+        self.set_chrome_visible(not manager.borderless)
         self.reader = threading.Thread(
             target=self._read_frames,
             name=f"camera-reader-{self.camera_index}",
@@ -1066,6 +1092,17 @@ class CameraPanel:
         self.panel.bind("<ButtonPress-1>", self._activate_panel, add="+")
         self.canvas.bind("<ButtonPress-1>", self._activate_panel, add="+")
         self.canvas.bind("<MouseWheel>", self.on_mouse_wheel)
+
+    def set_chrome_visible(self, visible: bool) -> None:
+        if self.chrome_visible == visible:
+            return
+        self.chrome_visible = visible
+        if visible:
+            self.panel.configure(highlightthickness=1)
+            self.header.pack(fill=tk.X, before=self.canvas)
+        else:
+            self.header.pack_forget()
+            self.panel.configure(highlightthickness=0)
 
     def _activate_panel(self, _event=None) -> None:
         self.manager.activate_panel(self)
@@ -1283,10 +1320,14 @@ class CameraManager:
         self.windows: dict[int | str, CameraPanel] = {}
         self.panel_placements = load_panel_placements()
         self.main_window_placement = load_main_window_placement()
+        self.always_on_top, self.borderless = load_preview_display_options()
         self.preview_window: tk.Toplevel | None = None
+        self.preview_toolbar: ttk.Frame | None = None
         self.workspace: tk.Frame | None = None
         self.active_panel: CameraPanel | None = None
         self.preview_fullscreen = False
+        self.topmost_button: ttk.Button | None = None
+        self.borderless_button: ttk.Button | None = None
         self._show_launcher_when_empty = not captures
         self.launcher_window: tk.Toplevel | None = None
         self._network_dialog_cleanups: set = set()
@@ -1325,7 +1366,10 @@ class CameraManager:
             except tk.TclError:
                 pass
             self.preview_window = None
+            self.preview_toolbar = None
             self.workspace = None
+            self.topmost_button = None
+            self.borderless_button = None
 
         window = tk.Toplevel(self.root)
         self.preview_window = window
@@ -1340,12 +1384,23 @@ class CameraManager:
         window.protocol("WM_DELETE_WINDOW", self.close_all)
 
         toolbar = ttk.Frame(window, padding=(8, 6))
+        self.preview_toolbar = toolbar
         toolbar.pack(fill=tk.X)
         ttk.Label(toolbar, text=WINDOW_TITLE, font=("Segoe UI", 11)).pack(side=tk.LEFT)
         ttk.Button(toolbar, text="\u5173\u95ed", command=self.close_all).pack(side=tk.RIGHT)
         ttk.Button(toolbar, text="\u5168\u5c4f", command=self.toggle_fullscreen).pack(
             side=tk.RIGHT, padx=(0, 6)
         )
+        self.borderless_button = ttk.Button(
+            toolbar,
+            command=self.toggle_borderless,
+        )
+        self.borderless_button.pack(side=tk.RIGHT, padx=(0, 6))
+        self.topmost_button = ttk.Button(
+            toolbar,
+            command=self.toggle_always_on_top,
+        )
+        self.topmost_button.pack(side=tk.RIGHT, padx=(0, 6))
         ttk.Button(
             toolbar,
             text="\u5feb\u6377\u952e",
@@ -1372,6 +1427,12 @@ class CameraManager:
         window.bind("<Key-q>", lambda _event: self._close_active_panel())
         window.bind("<Key-Q>", lambda _event: self._close_active_panel())
         window.bind("<Escape>", self.exit_fullscreen_or_close_active)
+        window.bind("<Control-b>", lambda _event: self.toggle_borderless())
+        window.bind("<Control-B>", lambda _event: self.toggle_borderless())
+        window.bind("<Control-t>", lambda _event: self.toggle_always_on_top())
+        window.bind("<Control-T>", lambda _event: self.toggle_always_on_top())
+        window.bind("<Button-3>", self.show_preview_menu, add="+")
+        self._apply_preview_display_options()
 
     def _show_preview_window(self) -> None:
         self.ensure_preview_window()
@@ -1391,6 +1452,80 @@ class CameraManager:
                 self.preview_window.withdraw()
         except tk.TclError:
             pass
+
+    def _save_preview_display_options(self) -> None:
+        try:
+            save_preview_display_options(self.always_on_top, self.borderless)
+        except OSError:
+            pass
+
+    def _update_preview_display_buttons(self) -> None:
+        if self.topmost_button is not None:
+            self.topmost_button.configure(
+                text="\u53d6\u6d88\u7f6e\u9876"
+                if self.always_on_top
+                else "\u7f6e\u9876"
+            )
+        if self.borderless_button is not None:
+            self.borderless_button.configure(
+                text="\u663e\u793a\u8fb9\u6846"
+                if self.borderless
+                else "\u7eaf\u753b\u9762"
+            )
+
+    def _apply_preview_display_options(self) -> None:
+        if self.preview_window is None:
+            return
+        try:
+            self.preview_window.attributes("-topmost", self.always_on_top)
+            self.preview_window.overrideredirect(self.borderless)
+            if self.preview_toolbar is not None:
+                if self.borderless:
+                    self.preview_toolbar.pack_forget()
+                elif not self.preview_toolbar.winfo_manager():
+                    self.preview_toolbar.pack(fill=tk.X, before=self.workspace)
+            for panel in self.windows.values():
+                panel.set_chrome_visible(not self.borderless)
+            self._update_preview_display_buttons()
+            if self.always_on_top:
+                self.preview_window.lift()
+        except tk.TclError:
+            pass
+
+    def toggle_always_on_top(self) -> None:
+        self.always_on_top = not self.always_on_top
+        self._apply_preview_display_options()
+        self._save_preview_display_options()
+
+    def toggle_borderless(self) -> None:
+        self.borderless = not self.borderless
+        self._apply_preview_display_options()
+        self._save_preview_display_options()
+
+    def show_preview_menu(self, event) -> str:
+        if self.preview_window is None:
+            return "break"
+        menu = tk.Menu(self.preview_window, tearoff=False)
+        menu.add_command(
+            label="\u53d6\u6d88\u7f6e\u9876"
+            if self.always_on_top
+            else "\u7f6e\u9876",
+            command=self.toggle_always_on_top,
+        )
+        menu.add_command(
+            label="\u663e\u793a\u8fb9\u6846"
+            if self.borderless
+            else "\u7eaf\u753b\u9762",
+            command=self.toggle_borderless,
+        )
+        menu.add_separator()
+        menu.add_command(label="\u5168\u5c4f", command=self.toggle_fullscreen)
+        menu.add_command(label="\u5173\u95ed", command=self.close_all)
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+        return "break"
 
     def _reset_active_panel(self) -> None:
         if self.active_panel is not None and self.active_panel.running:
