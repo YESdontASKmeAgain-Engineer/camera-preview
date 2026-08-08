@@ -65,7 +65,7 @@ MOD_ALT = 0x0001
 MOD_CONTROL = 0x0002
 MOD_SHIFT = 0x0004
 MOD_NOREPEAT = 0x4000
-VK_H = 0x48
+VK_E = 0x45
 DEFAULT_HOTKEY_MODIFIERS = MOD_CONTROL
 HOTKEY_SETTINGS_FILENAME = "camera_preview_settings.json"
 TK_SHIFT_MASK = 0x0001
@@ -198,7 +198,7 @@ class GlobalHotkey:
         return SPECIAL_KEY_LABELS.get(self.key, f"Key {self.key}")
 
 
-DEFAULT_HOTKEY = GlobalHotkey(DEFAULT_HOTKEY_MODIFIERS, VK_H)
+DEFAULT_HOTKEY = GlobalHotkey(DEFAULT_HOTKEY_MODIFIERS, VK_E)
 MIN_WINDOW_WIDTH = 480
 MIN_WINDOW_HEIGHT = 360
 MAX_WINDOW_DIMENSION = 10000
@@ -763,6 +763,114 @@ def open_captures(
         captures.append(opened)
         opened_indices.add(index)
     return captures
+
+
+def select_local_captures(
+    captures: list[OpenedCapture],
+) -> list[OpenedCapture] | None:
+    """Let the user choose which detected local cameras should be displayed."""
+    if len(captures) <= 1:
+        return captures
+
+    root = tk.Tk()
+    root.withdraw()
+    dialog = tk.Toplevel(root)
+    dialog.title("\u9009\u62e9\u6444\u50cf\u5934")
+    dialog.resizable(False, False)
+    dialog.geometry("480x330")
+    dialog.transient(root)
+
+    selected: list[OpenedCapture] | None = None
+
+    container = ttk.Frame(dialog, padding=16)
+    container.pack(fill=tk.BOTH, expand=True)
+    ttk.Label(
+        container,
+        text=(
+            f"\u68c0\u6d4b\u5230 {len(captures)} \u53f0 USB \u6444\u50cf\u5934\uff0c"
+            "\u9009\u62e9\u8981\u663e\u793a\u7684\u8bbe\u5907\uff1a"
+        ),
+    ).pack(anchor=tk.W)
+
+    list_frame = ttk.Frame(container)
+    list_frame.pack(fill=tk.BOTH, expand=True, pady=(10, 12))
+    listbox = tk.Listbox(
+        list_frame,
+        height=min(max(len(captures), 4), 10),
+        selectmode=tk.EXTENDED,
+        exportselection=False,
+    )
+    listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+    scrollbar = ttk.Scrollbar(list_frame, orient=tk.VERTICAL, command=listbox.yview)
+    scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+    listbox.configure(yscrollcommand=scrollbar.set)
+
+    for opened in captures:
+        name = opened.display_name or f"\u6444\u50cf\u5934 {opened.index}"
+        listbox.insert(tk.END, f"{name} ({opened.backend})")
+    listbox.selection_set(0)
+    listbox.activate(0)
+
+    def accept() -> None:
+        nonlocal selected
+        positions = listbox.curselection()
+        if not positions:
+            messagebox.showwarning(
+                WINDOW_TITLE,
+                "\u8bf7\u81f3\u5c11\u9009\u62e9\u4e00\u53f0\u6444\u50cf\u5934\u3002",
+                parent=dialog,
+            )
+            return
+        selected = [captures[position] for position in positions]
+        dialog.destroy()
+
+    def cancel() -> None:
+        dialog.destroy()
+
+    buttons = ttk.Frame(container)
+    buttons.pack(fill=tk.X)
+    ttk.Button(buttons, text="\u663e\u793a\u9009\u4e2d", command=accept).pack(
+        side=tk.RIGHT
+    )
+    ttk.Button(buttons, text="\u53d6\u6d88", command=cancel).pack(
+        side=tk.RIGHT, padx=(0, 6)
+    )
+
+    listbox.bind("<Double-Button-1>", lambda _event: accept())
+    dialog.bind("<Return>", lambda _event: accept())
+    dialog.bind("<Escape>", lambda _event: cancel())
+    dialog.protocol("WM_DELETE_WINDOW", cancel)
+    dialog.grab_set()
+
+    def center_dialog() -> None:
+        try:
+            dialog.update_idletasks()
+            left = max(0, (dialog.winfo_screenwidth() - dialog.winfo_width()) // 2)
+            top = max(0, (dialog.winfo_screenheight() - dialog.winfo_height()) // 2)
+            dialog.geometry(f"+{left}+{top}")
+            listbox.focus_set()
+        except tk.TclError:
+            pass
+
+    dialog.after_idle(center_dialog)
+    try:
+        root.wait_window(dialog)
+    finally:
+        try:
+            root.destroy()
+        except tk.TclError:
+            pass
+
+    if selected is None:
+        for opened in captures:
+            opened.capture.release()
+        return None
+
+    selected_ids = {id(opened) for opened in selected}
+    for opened in captures:
+        if id(opened) not in selected_ids:
+            opened.capture.release()
+    return selected
 
 
 def list_cameras(max_index: int, width: int, height: int, fps: int) -> int:
@@ -1330,12 +1438,23 @@ class CameraManager:
         fps: int,
         max_index: int,
         capture_fourcc: str = DEFAULT_CAPTURE_FOURCC,
+        available_local_indices: Iterable[int] | None = None,
     ) -> None:
         self.width = width
         self.height = height
         self.fps = fps
         self.max_index = max_index
         self.capture_fourcc = capture_fourcc
+        self.local_camera_indices: set[int] = {
+            index
+            for index in (available_local_indices or ())
+            if isinstance(index, int) and index >= 0
+        }
+        self.local_camera_indices.update(
+            opened.index
+            for opened in captures
+            if isinstance(opened.index, int) and opened.index >= 0
+        )
         self.root = tk.Tk()
         self.root.withdraw()
         self.root.protocol("WM_DELETE_WINDOW", self.close_all)
@@ -1436,6 +1555,9 @@ class CameraManager:
         ttk.Button(toolbar, text="\u626b\u63cf", command=self.scan_for_cameras).pack(
             side=tk.RIGHT, padx=(0, 6)
         )
+        ttk.Button(toolbar, text="\u5207\u6362", command=self.switch_camera).pack(
+            side=tk.RIGHT, padx=(0, 6)
+        )
 
         self.workspace = tk.Frame(window, background="#0f141b", highlightthickness=0)
         self.workspace.pack(fill=tk.BOTH, expand=True)
@@ -1453,6 +1575,14 @@ class CameraManager:
         window.bind("<Control-B>", lambda _event: self.toggle_borderless())
         window.bind("<Control-t>", lambda _event: self.toggle_always_on_top())
         window.bind("<Control-T>", lambda _event: self.toggle_always_on_top())
+        window.bind(
+            "<Control-KeyPress-d>",
+            lambda _event: self._handle_camera_switch(1),
+        )
+        window.bind(
+            "<Control-KeyPress-a>",
+            lambda _event: self._handle_camera_switch(-1),
+        )
         window.bind("<Button-3>", self.show_preview_menu, add="+")
         self._apply_preview_display_options()
 
@@ -1540,6 +1670,7 @@ class CameraManager:
             else "\u7eaf\u753b\u9762",
             command=self.toggle_borderless,
         )
+        menu.add_command(label="\u5207\u6362\u6444\u50cf\u5934", command=self.switch_camera)
         menu.add_separator()
         menu.add_command(label="\u5168\u5c4f", command=self.toggle_fullscreen)
         menu.add_command(label="\u5173\u95ed", command=self.close_all)
@@ -1560,6 +1691,92 @@ class CameraManager:
     def _close_active_panel(self) -> None:
         if self.active_panel is not None and self.active_panel.running:
             self.active_panel.close()
+
+    def _handle_camera_switch(self, direction: int) -> str:
+        self.switch_camera(direction)
+        return "break"
+
+    def _replace_panel_camera(
+        self, panel: CameraPanel, opened: OpenedCapture
+    ) -> bool:
+        try:
+            placement = panel.current_placement()
+        except tk.TclError:
+            placement = None
+
+        old_index = panel.camera_index
+        panel.close(notify_manager=False)
+        self.windows.pop(old_index, None)
+        if self.active_panel is panel:
+            self.active_panel = None
+
+        if placement is not None:
+            self.panel_placements[opened.index] = placement
+        return self.add_camera(opened, position=0)
+
+    def switch_camera(self, direction: int = 1) -> None:
+        """Activate or replace the current panel with the next local camera."""
+        if self.shutting_down:
+            return
+        direction = -1 if direction < 0 else 1
+        local_indices = sorted(self.local_camera_indices)
+        if not local_indices:
+            return
+
+        source_panel = self.active_panel
+        if source_panel is None or not isinstance(source_panel.camera_index, int):
+            source_panel = next(
+                (
+                    panel
+                    for panel in self.windows.values()
+                    if isinstance(panel.camera_index, int)
+                ),
+                None,
+            )
+        current_index = source_panel.camera_index if source_panel is not None else None
+        if len(local_indices) == 1 and current_index == local_indices[0]:
+            if source_panel is not None:
+                source_panel.set_status(
+                    "\u6ca1\u6709\u5176\u4ed6\u53ef\u7528\u7684\u672c\u5730\u6444\u50cf\u5934\u3002"
+                )
+            return
+
+        if current_index in local_indices:
+            start = local_indices.index(current_index)
+        else:
+            start = -1 if direction > 0 else 0
+
+        for step in range(1, len(local_indices) + 1):
+            candidate_index = local_indices[(start + direction * step) % len(local_indices)]
+            if candidate_index == current_index:
+                continue
+
+            existing = self.windows.get(candidate_index)
+            if existing is not None:
+                self.activate_panel(existing)
+                existing.set_status(f"\u5df2\u5207\u6362\u5230 \u6444\u50cf\u5934 {candidate_index}")
+                return
+
+            try:
+                opened = open_capture(
+                    candidate_index,
+                    self.width,
+                    self.height,
+                    self.fps,
+                    self.capture_fourcc,
+                )
+            except RuntimeError:
+                continue
+
+            if source_panel is None:
+                if self.add_camera(opened):
+                    return
+                continue
+            if self._replace_panel_camera(source_panel, opened):
+                return
+
+        if source_panel is not None and source_panel.running:
+            source_panel.set_status("\u6ca1\u6709\u627e\u5230\u5176\u4ed6\u53ef\u7528\u7684\u672c\u5730\u6444\u50cf\u5934\u3002")
 
     def activate_panel(self, panel: CameraPanel) -> None:
         if not panel.running:
@@ -1590,6 +1807,8 @@ class CameraManager:
         if opened.index in self.windows:
             opened.capture.release()
             return False
+        if isinstance(opened.index, int) and opened.index >= 0:
+            self.local_camera_indices.add(opened.index)
         if position is None:
             position = len(self.windows)
         self.ensure_preview_window()
@@ -2261,8 +2480,17 @@ def show_previews(
     fps: int,
     max_index: int,
     capture_fourcc: str = DEFAULT_CAPTURE_FOURCC,
+    available_local_indices: Iterable[int] | None = None,
 ) -> int:
-    manager = CameraManager(captures, width, height, fps, max_index, capture_fourcc)
+    manager = CameraManager(
+        captures,
+        width,
+        height,
+        fps,
+        max_index,
+        capture_fourcc,
+        available_local_indices,
+    )
     manager.run()
     return 0
 
@@ -2278,7 +2506,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--all",
         action="store_true",
-        help="Open every usable camera found up to --max-index.",
+        help="Skip startup selection and open every usable camera up to --max-index.",
     )
     parser.add_argument("--width", type=int, default=1280, help="Requested frame width.")
     parser.add_argument("--height", type=int, default=720, help="Requested frame height.")
@@ -2299,6 +2527,7 @@ def main() -> int:
         return list_cameras(args.max_index, args.width, args.height, args.fps)
 
     scan_all = args.all or not args.camera
+    auto_select = not args.camera and not args.all and not args.self_test
     indices: Iterable[int] = range(args.max_index + 1) if scan_all else args.camera
     capture_width = args.width
     capture_height = args.height
@@ -2311,45 +2540,45 @@ def main() -> int:
         capture_fps,
         capture_fourcc,
     )
-    if not captures:
-        if not scan_all:
-            requested = ", ".join(str(index) for index in args.camera)
-            raise RuntimeError(f"Cannot open requested camera(s): {requested}")
-        if args.self_test:
-            raise RuntimeError("No usable camera was found.")
-        return show_previews(
-            [],
-            capture_width,
-            capture_height,
-            capture_fps,
-            args.max_index,
-            capture_fourcc,
-        )
+    available_local_indices = [
+        opened.index
+        for opened in captures
+        if isinstance(opened.index, int) and opened.index >= 0
+    ]
+    try:
+        if not captures:
+            if not scan_all:
+                requested = ", ".join(str(index) for index in args.camera)
+                raise RuntimeError(f"Cannot open requested camera(s): {requested}")
+            if args.self_test:
+                raise RuntimeError("No usable camera was found.")
+            return show_previews(
+                [],
+                capture_width,
+                capture_height,
+                capture_fps,
+                args.max_index,
+                capture_fourcc,
+                available_local_indices,
+            )
 
-    if len(captures) > 1:
-        expected_count = len(captures)
-        for opened in captures:
-            opened.capture.release()
-        time.sleep(0.2)
-        capture_width = min(args.width, MULTI_CAMERA_WIDTH)
-        capture_height = min(args.height, MULTI_CAMERA_HEIGHT)
-        capture_fps = min(args.fps, MULTI_CAMERA_FPS)
-        capture_fourcc = MULTI_CAMERA_FOURCC
-        captures = open_captures(
-            indices,
-            capture_width,
-            capture_height,
-            capture_fps,
-            capture_fourcc,
-        )
-        if len(captures) < expected_count:
+        if auto_select and len(captures) > 1:
+            selected = select_local_captures(captures)
+            if selected is None:
+                captures = []
+                return 0
+            captures = selected
+            indices = [int(opened.index) for opened in captures]
+
+        if len(captures) > 1:
+            expected_count = len(captures)
             for opened in captures:
                 opened.capture.release()
             time.sleep(0.2)
-            capture_width = args.width
-            capture_height = args.height
-            capture_fps = args.fps
-            capture_fourcc = DEFAULT_CAPTURE_FOURCC
+            capture_width = min(args.width, MULTI_CAMERA_WIDTH)
+            capture_height = min(args.height, MULTI_CAMERA_HEIGHT)
+            capture_fps = min(args.fps, MULTI_CAMERA_FPS)
+            capture_fourcc = MULTI_CAMERA_FOURCC
             captures = open_captures(
                 indices,
                 capture_width,
@@ -2357,8 +2586,22 @@ def main() -> int:
                 capture_fps,
                 capture_fourcc,
             )
+            if len(captures) < expected_count:
+                for opened in captures:
+                    opened.capture.release()
+                time.sleep(0.2)
+                capture_width = args.width
+                capture_height = args.height
+                capture_fps = args.fps
+                capture_fourcc = DEFAULT_CAPTURE_FOURCC
+                captures = open_captures(
+                    indices,
+                    capture_width,
+                    capture_height,
+                    capture_fps,
+                    capture_fourcc,
+                )
 
-    try:
         for opened in captures:
             actual_width = int(opened.capture.get(cv2.CAP_PROP_FRAME_WIDTH))
             actual_height = int(opened.capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -2377,6 +2620,7 @@ def main() -> int:
             capture_fps,
             args.max_index,
             capture_fourcc,
+            available_local_indices,
         )
     finally:
         for opened in captures:
