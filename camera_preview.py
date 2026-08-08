@@ -10,20 +10,37 @@ from __future__ import annotations
 import argparse
 import base64
 import ctypes
+import hashlib
 import json
+import os
 import queue
+import re
+import socket
 import sys
 import threading
 import time
 import tkinter as tk
+import uuid
+import xml.etree.ElementTree as ET
 from ctypes import wintypes
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from tkinter import messagebox, ttk
 from typing import Iterable
+from urllib.error import HTTPError, URLError
+from urllib.parse import quote, unquote, urlsplit, urlunsplit
+from urllib.request import (
+    HTTPBasicAuthHandler,
+    HTTPDigestAuthHandler,
+    HTTPPasswordMgrWithDefaultRealm,
+    Request,
+    build_opener,
+)
+from xml.sax.saxutils import escape as xml_escape
 
 import cv2
+from PIL import Image, ImageTk
 
 
 WINDOW_TITLE = "\u6444\u50cf\u5934\u9884\u89c8"
@@ -32,6 +49,9 @@ BACKENDS = (
     ("Media Foundation", cv2.CAP_MSMF),
 )
 MAX_ZOOM = 8.0
+DISPLAY_INTERVAL_MS = 50
+MULTI_CAMERA_FPS = 15
+MULTI_CAMERA_DISPLAY_INTERVAL_MS = 100
 WM_HOTKEY = 0x0312
 WM_QUIT = 0x0012
 HOTKEY_ID = 0xCA01
@@ -173,6 +193,80 @@ class GlobalHotkey:
 
 
 DEFAULT_HOTKEY = GlobalHotkey(DEFAULT_HOTKEY_MODIFIERS, VK_H)
+MIN_WINDOW_WIDTH = 480
+MIN_WINDOW_HEIGHT = 360
+MAX_WINDOW_DIMENSION = 10000
+MAX_WINDOW_COORDINATE = 100000
+NETWORK_DISCOVERY_TIMEOUT_SECONDS = 3.0
+NETWORK_REQUEST_TIMEOUT_SECONDS = 5.0
+NETWORK_STREAM_TIMEOUT_MILLISECONDS = 6000
+WS_DISCOVERY_ADDRESS = "239.255.255.250"
+WS_DISCOVERY_PORT = 3702
+SOAP_ENVELOPE_NAMESPACE = "http://www.w3.org/2003/05/soap-envelope"
+WS_DISCOVERY_2005_NAMESPACE = "http://schemas.xmlsoap.org/ws/2005/04/discovery"
+WS_DISCOVERY_2005_ADDRESSING_NAMESPACE = "http://schemas.xmlsoap.org/ws/2004/08/addressing"
+WS_DISCOVERY_1_1_NAMESPACE = "http://docs.oasis-open.org/ws-dd/ns/discovery"
+WS_DISCOVERY_1_1_ADDRESSING_NAMESPACE = "http://www.w3.org/2005/08/addressing"
+ONVIF_DEVICE_NAMESPACE = "http://www.onvif.org/ver10/device/wsdl"
+ONVIF_MEDIA_NAMESPACE = "http://www.onvif.org/ver10/media/wsdl"
+ONVIF_SCHEMA_NAMESPACE = "http://www.onvif.org/ver10/schema"
+WS_SECURITY_NAMESPACE = (
+    "http://docs.oasis-open.org/wss/2004/01/"
+    "oasis-200401-wss-wssecurity-secext-1.0.xsd"
+)
+WS_UTILITY_NAMESPACE = (
+    "http://docs.oasis-open.org/wss/2004/01/"
+    "oasis-200401-wss-wssecurity-utility-1.0.xsd"
+)
+WS_PASSWORD_DIGEST_TYPE = (
+    "http://docs.oasis-open.org/wss/2004/01/"
+    "oasis-200401-wss-username-token-profile-1.0#PasswordDigest"
+)
+WS_NONCE_BASE64_TYPE = (
+    "http://docs.oasis-open.org/wss/2004/01/"
+    "oasis-200401-wss-soap-message-security-1.0#Base64Binary"
+)
+
+
+@dataclass(frozen=True)
+class WindowPlacement:
+    """The last known window bounds for one camera index."""
+
+    x: int
+    y: int
+    width: int
+    height: int
+
+    @classmethod
+    def from_payload(cls, payload: object) -> "WindowPlacement | None":
+        if not isinstance(payload, dict):
+            return None
+        try:
+            placement = cls(
+                x=int(payload["x"]),
+                y=int(payload["y"]),
+                width=int(payload["width"]),
+                height=int(payload["height"]),
+            )
+        except (KeyError, TypeError, ValueError):
+            return None
+
+        if not (
+            -MAX_WINDOW_COORDINATE <= placement.x <= MAX_WINDOW_COORDINATE
+            and -MAX_WINDOW_COORDINATE <= placement.y <= MAX_WINDOW_COORDINATE
+            and MIN_WINDOW_WIDTH <= placement.width <= MAX_WINDOW_DIMENSION
+            and MIN_WINDOW_HEIGHT <= placement.height <= MAX_WINDOW_DIMENSION
+        ):
+            return None
+        return placement
+
+    def to_payload(self) -> dict[str, int]:
+        return {
+            "x": self.x,
+            "y": self.y,
+            "width": self.width,
+            "height": self.height,
+        }
 
 
 def is_valid_hotkey(hotkey: GlobalHotkey) -> bool:
@@ -216,9 +310,396 @@ def selectable_hotkeys() -> dict[str, GlobalHotkey]:
 
 @dataclass
 class OpenedCapture:
-    index: int
+    index: int | str
     capture: cv2.VideoCapture
     backend: str
+    display_name: str | None = None
+
+
+@dataclass(frozen=True)
+class DiscoveredNetworkCamera:
+    endpoint: str
+    host: str
+    name: str = ""
+    scopes: tuple[str, ...] = ()
+
+    @property
+    def display_name(self) -> str:
+        if self.name:
+            return f"{self.name} ({self.host})"
+        return f"\u7f51\u7edc\u6444\u50cf\u5934 ({self.host})"
+
+
+def _xml_local_name(tag: str) -> str:
+    return tag.rsplit("}", 1)[-1]
+
+
+def _find_xml_text(root: ET.Element, local_name: str) -> str | None:
+    for element in root.iter():
+        if _xml_local_name(element.tag) == local_name and element.text:
+            text = element.text.strip()
+            if text:
+                return text
+    return None
+
+
+def _find_xml_child_text(element: ET.Element, local_name: str) -> str | None:
+    for child in element.iter():
+        if _xml_local_name(child.tag) == local_name and child.text:
+            text = child.text.strip()
+            if text:
+                return text
+    return None
+
+
+def _network_camera_name(scopes: Iterable[str]) -> str:
+    marker = "/name/"
+    for scope in scopes:
+        if marker in scope:
+            return unquote(scope.split(marker, 1)[1]).strip()
+    return ""
+
+
+def parse_onvif_discovery_response(
+    payload: bytes, sender_host: str = ""
+) -> list[DiscoveredNetworkCamera]:
+    """Extract ONVIF device service endpoints from one WS-Discovery reply."""
+    try:
+        root = ET.fromstring(payload)
+    except ET.ParseError:
+        return []
+
+    raw_xaddrs = _find_xml_text(root, "XAddrs")
+    if not raw_xaddrs:
+        return []
+    scopes = tuple(
+        text
+        for element in root.iter()
+        if _xml_local_name(element.tag) == "Scopes" and element.text
+        for text in element.text.split()
+    )
+    name = _network_camera_name(scopes)
+    cameras: list[DiscoveredNetworkCamera] = []
+    for endpoint in raw_xaddrs.split():
+        parsed = urlsplit(endpoint)
+        if parsed.scheme.lower() not in {"http", "https"}:
+            continue
+        host = parsed.hostname or sender_host
+        if not host:
+            continue
+        cameras.append(
+            DiscoveredNetworkCamera(
+                endpoint=endpoint,
+                host=host,
+                name=name,
+                scopes=scopes,
+            )
+        )
+    return cameras
+
+
+def _ws_discovery_probe(
+    discovery_namespace: str, addressing_namespace: str, target: str
+) -> bytes:
+    message_id = uuid.uuid4()
+    action = f"{discovery_namespace}/Probe"
+    message = f'''<?xml version="1.0" encoding="UTF-8"?>
+<s:Envelope xmlns:s="{SOAP_ENVELOPE_NAMESPACE}"
+            xmlns:a="{addressing_namespace}"
+            xmlns:d="{discovery_namespace}"
+            xmlns:dn="http://www.onvif.org/ver10/network/wsdl">
+  <s:Header>
+    <a:MessageID>uuid:{message_id}</a:MessageID>
+    <a:To s:mustUnderstand="true">{target}</a:To>
+    <a:Action s:mustUnderstand="true">{action}</a:Action>
+  </s:Header>
+  <s:Body>
+    <d:Probe><d:Types>dn:NetworkVideoTransmitter</d:Types></d:Probe>
+  </s:Body>
+</s:Envelope>'''
+    return message.encode("utf-8")
+
+
+def discover_network_cameras(
+    timeout: float = NETWORK_DISCOVERY_TIMEOUT_SECONDS,
+) -> list[DiscoveredNetworkCamera]:
+    """Discover ONVIF cameras on the local network without scanning IP ranges."""
+    if timeout <= 0:
+        raise ValueError("Discovery timeout must be positive.")
+
+    probes = (
+        _ws_discovery_probe(
+            WS_DISCOVERY_2005_NAMESPACE,
+            WS_DISCOVERY_2005_ADDRESSING_NAMESPACE,
+            "urn:schemas-xmlsoap-org:ws:2005:04:discovery",
+        ),
+        _ws_discovery_probe(
+            WS_DISCOVERY_1_1_NAMESPACE,
+            WS_DISCOVERY_1_1_ADDRESSING_NAMESPACE,
+            "urn:docs-oasis-open-org:ws-dd:ns:discovery",
+        ),
+    )
+    discovered: dict[str, DiscoveredNetworkCamera] = {}
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP) as sock:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+            sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
+            sock.bind(("", 0))
+            for probe in probes:
+                for target in (WS_DISCOVERY_ADDRESS, "255.255.255.255"):
+                    try:
+                        sock.sendto(probe, (target, WS_DISCOVERY_PORT))
+                    except OSError:
+                        continue
+
+            deadline = time.monotonic() + timeout
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                sock.settimeout(min(0.25, remaining))
+                try:
+                    payload, sender = sock.recvfrom(65535)
+                except socket.timeout:
+                    continue
+                except OSError as error:
+                    raise RuntimeError(f"Network discovery failed: {error}") from error
+                sender_host = sender[0] if sender else ""
+                for camera in parse_onvif_discovery_response(payload, sender_host):
+                    discovered.setdefault(camera.endpoint, camera)
+    except OSError as error:
+        raise RuntimeError(f"Network discovery failed: {error}") from error
+
+    return sorted(discovered.values(), key=lambda camera: (camera.host, camera.name))
+
+
+def _onvif_security_header(username: str, password: str) -> str:
+    if not username:
+        return ""
+    nonce = os.urandom(16)
+    created = datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace(
+        "+00:00", "Z"
+    )
+    digest = base64.b64encode(
+        hashlib.sha1(nonce + created.encode("utf-8") + password.encode("utf-8")).digest()
+    ).decode("ascii")
+    encoded_nonce = base64.b64encode(nonce).decode("ascii")
+    return f'''<wsse:Security s:mustUnderstand="true"
+        xmlns:wsse="{WS_SECURITY_NAMESPACE}"
+        xmlns:wsu="{WS_UTILITY_NAMESPACE}">
+      <wsse:UsernameToken>
+        <wsse:Username>{xml_escape(username)}</wsse:Username>
+        <wsse:Password Type="{WS_PASSWORD_DIGEST_TYPE}">{digest}</wsse:Password>
+        <wsse:Nonce EncodingType="{WS_NONCE_BASE64_TYPE}">{encoded_nonce}</wsse:Nonce>
+        <wsu:Created>{created}</wsu:Created>
+      </wsse:UsernameToken>
+    </wsse:Security>'''
+
+
+def build_onvif_soap_envelope(
+    body: str, action: str, username: str = "", password: str = ""
+) -> bytes:
+    """Build a SOAP 1.2 request with optional ONVIF WS-Security credentials."""
+    security = _onvif_security_header(username, password)
+    envelope = f'''<?xml version="1.0" encoding="UTF-8"?>
+<s:Envelope xmlns:s="{SOAP_ENVELOPE_NAMESPACE}"
+            xmlns:wsa="{WS_DISCOVERY_1_1_ADDRESSING_NAMESPACE}">
+  <s:Header>
+    <wsa:Action s:mustUnderstand="true">{xml_escape(action)}</wsa:Action>
+    {security}
+  </s:Header>
+  <s:Body>{body}</s:Body>
+</s:Envelope>'''
+    return envelope.encode("utf-8")
+
+
+def _onvif_request(
+    endpoint: str, body: str, action: str, username: str, password: str
+) -> ET.Element:
+    request = Request(
+        endpoint,
+        data=build_onvif_soap_envelope(body, action, username, password),
+        headers={
+            "Content-Type": f'application/soap+xml; charset=utf-8; action="{action}"',
+            "SOAPAction": f'"{action}"',
+        },
+        method="POST",
+    )
+    password_manager = HTTPPasswordMgrWithDefaultRealm()
+    if username:
+        password_manager.add_password(None, endpoint, username, password)
+    opener = build_opener(
+        HTTPDigestAuthHandler(password_manager), HTTPBasicAuthHandler(password_manager)
+    )
+    try:
+        with opener.open(request, timeout=NETWORK_REQUEST_TIMEOUT_SECONDS) as response:
+            return ET.fromstring(response.read())
+    except (HTTPError, URLError, OSError, TimeoutError, ET.ParseError) as error:
+        raise RuntimeError(f"ONVIF request failed: {error}") from error
+
+
+def _onvif_media_endpoint(root: ET.Element) -> str | None:
+    for element in root.iter():
+        if _xml_local_name(element.tag) in {"Media", "Media2"}:
+            endpoint = _find_xml_child_text(element, "XAddr")
+            if endpoint:
+                return endpoint
+    return None
+
+
+def _with_rtsp_credentials(stream_url: str, username: str, password: str) -> str:
+    if not username:
+        return stream_url
+    parsed = urlsplit(stream_url)
+    if parsed.username is not None or not parsed.hostname:
+        return stream_url
+    user_info = quote(username, safe="")
+    if password:
+        user_info = f"{user_info}:{quote(password, safe='')}"
+    host = parsed.hostname
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    if parsed.port is not None:
+        host = f"{host}:{parsed.port}"
+    return urlunsplit((parsed.scheme, f"{user_info}@{host}", parsed.path, parsed.query, ""))
+
+
+def resolve_onvif_stream_urls(
+    camera: DiscoveredNetworkCamera, username: str = "", password: str = ""
+) -> list[str]:
+    """Ask an ONVIF camera for the RTSP stream URL of its available profiles."""
+    capabilities_action = f"{ONVIF_DEVICE_NAMESPACE}/GetCapabilities"
+    capabilities = _onvif_request(
+        camera.endpoint,
+        f'<tds:GetCapabilities xmlns:tds="{ONVIF_DEVICE_NAMESPACE}">'
+        "<tds:Category>All</tds:Category>"
+        "</tds:GetCapabilities>",
+        capabilities_action,
+        username,
+        password,
+    )
+    media_endpoint = _onvif_media_endpoint(capabilities)
+    if not media_endpoint:
+        raise RuntimeError("The ONVIF camera did not provide a media service endpoint.")
+
+    profiles_action = f"{ONVIF_MEDIA_NAMESPACE}/GetProfiles"
+    profiles = _onvif_request(
+        media_endpoint,
+        f'<trt:GetProfiles xmlns:trt="{ONVIF_MEDIA_NAMESPACE}"/>',
+        profiles_action,
+        username,
+        password,
+    )
+    tokens = [
+        profile.attrib["token"]
+        for profile in profiles.iter()
+        if _xml_local_name(profile.tag) in {"Profiles", "Profile"}
+        and profile.attrib.get("token")
+    ]
+    if not tokens:
+        raise RuntimeError("The ONVIF camera did not provide a video profile.")
+
+    stream_action = f"{ONVIF_MEDIA_NAMESPACE}/GetStreamUri"
+    urls: list[str] = []
+    for token in tokens[:4]:
+        try:
+            stream = _onvif_request(
+                media_endpoint,
+                f'''<trt:GetStreamUri xmlns:trt="{ONVIF_MEDIA_NAMESPACE}"
+                    xmlns:tt="{ONVIF_SCHEMA_NAMESPACE}">
+                  <trt:StreamSetup>
+                    <tt:Stream>RTP-Unicast</tt:Stream>
+                    <tt:Transport><tt:Protocol>RTSP</tt:Protocol></tt:Transport>
+                  </trt:StreamSetup>
+                  <trt:ProfileToken>{xml_escape(token)}</trt:ProfileToken>
+                </trt:GetStreamUri>''',
+                stream_action,
+                username,
+                password,
+            )
+        except RuntimeError:
+            continue
+        stream_url = _find_xml_text(stream, "Uri")
+        if stream_url:
+            urls.append(_with_rtsp_credentials(stream_url, username, password))
+    unique_urls = list(dict.fromkeys(urls))
+    if not unique_urls:
+        raise RuntimeError("The ONVIF camera did not return an RTSP stream URL.")
+    return unique_urls
+
+
+def normalize_network_stream_url(stream_url: str) -> str:
+    stream_url = stream_url.strip()
+    parsed = urlsplit(stream_url)
+    if parsed.scheme.lower() not in {"rtsp", "rtsps", "http", "https"} or not parsed.hostname:
+        raise ValueError("Enter a complete RTSP or HTTP stream address.")
+    try:
+        parsed.port
+    except ValueError as error:
+        raise ValueError("The stream address contains an invalid port.") from error
+    return stream_url
+
+
+def network_source_id(stream_url: str) -> str:
+    parsed = urlsplit(stream_url)
+    host = parsed.hostname or ""
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    if parsed.port is not None:
+        host = f"{host}:{parsed.port}"
+    canonical = urlunsplit(
+        (parsed.scheme.lower(), host.lower(), parsed.path or "/", parsed.query, "")
+    )
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
+    return f"network-{digest}"
+
+
+def network_display_name(stream_url: str) -> str:
+    host = urlsplit(stream_url).hostname
+    return f"\u7f51\u7edc\u6444\u50cf\u5934 {host or stream_url}"
+
+
+def _create_network_capture(stream_url: str, backend_id: int) -> cv2.VideoCapture:
+    if backend_id == cv2.CAP_FFMPEG:
+        open_timeout = getattr(cv2, "CAP_PROP_OPEN_TIMEOUT_MSEC", None)
+        read_timeout = getattr(cv2, "CAP_PROP_READ_TIMEOUT_MSEC", None)
+        if open_timeout is not None and read_timeout is not None:
+            try:
+                return cv2.VideoCapture(
+                    stream_url,
+                    backend_id,
+                    [
+                        open_timeout,
+                        NETWORK_STREAM_TIMEOUT_MILLISECONDS,
+                        read_timeout,
+                        NETWORK_STREAM_TIMEOUT_MILLISECONDS,
+                    ],
+                )
+            except cv2.error:
+                pass
+    return cv2.VideoCapture(stream_url, backend_id)
+
+
+def open_network_capture(stream_url: str) -> OpenedCapture:
+    stream_url = normalize_network_stream_url(stream_url)
+    backend_candidates = (("FFmpeg", cv2.CAP_FFMPEG), ("OpenCV", cv2.CAP_ANY))
+    for backend_name, backend_id in backend_candidates:
+        capture = _create_network_capture(stream_url, backend_id)
+        if not capture.isOpened():
+            capture.release()
+            continue
+        capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        ok, _ = capture.read()
+        if ok:
+            return OpenedCapture(
+                index=network_source_id(stream_url),
+                capture=capture,
+                backend=backend_name,
+                display_name=network_display_name(stream_url),
+            )
+        capture.release()
+    raise RuntimeError("Could not open the network camera stream.")
 
 
 def configure_capture(capture: cv2.VideoCapture, width: int, height: int, fps: int) -> None:
@@ -226,6 +707,7 @@ def configure_capture(capture: cv2.VideoCapture, width: int, height: int, fps: i
     capture.set(cv2.CAP_PROP_FRAME_WIDTH, width)
     capture.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
     capture.set(cv2.CAP_PROP_FPS, fps)
+    capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
 
 def open_capture(index: int, width: int, height: int, fps: int) -> OpenedCapture:
@@ -290,11 +772,26 @@ def hotkey_settings_path() -> Path:
     return application_directory() / HOTKEY_SETTINGS_FILENAME
 
 
-def load_hotkey() -> GlobalHotkey:
+def load_settings_payload() -> dict[str, object]:
     try:
         payload = json.loads(hotkey_settings_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def save_settings_payload(payload: dict[str, object]) -> None:
+    settings_path = hotkey_settings_path()
+    temporary_path = settings_path.with_suffix(f"{settings_path.suffix}.tmp")
+    temporary_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    temporary_path.replace(settings_path)
+
+
+def load_hotkey() -> GlobalHotkey:
+    payload = load_settings_payload()
+    try:
         hotkey = GlobalHotkey(int(payload["modifiers"]), int(payload["key"]))
-    except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+    except (ValueError, KeyError, TypeError):
         return DEFAULT_HOTKEY
     if is_valid_hotkey(hotkey):
         return hotkey
@@ -306,17 +803,60 @@ def load_hotkey() -> GlobalHotkey:
 
 
 def save_hotkey(hotkey: GlobalHotkey) -> None:
-    payload = {"modifiers": hotkey.modifiers, "key": hotkey.key}
-    hotkey_settings_path().write_text(
-        json.dumps(payload, indent=2) + "\n", encoding="utf-8"
-    )
+    payload = load_settings_payload()
+    payload["modifiers"] = hotkey.modifiers
+    payload["key"] = hotkey.key
+    save_settings_payload(payload)
 
 
-def save_frame(frame, camera_index: int) -> Path:
+def _camera_source_key(camera_index: int | str) -> int | str | None:
+    if isinstance(camera_index, int):
+        return camera_index if camera_index >= 0 else None
+    if not isinstance(camera_index, str):
+        return None
+    camera_index = camera_index.strip()
+    if not camera_index:
+        return None
+    if camera_index.isdecimal():
+        return int(camera_index)
+    return camera_index
+
+
+def load_window_placements() -> dict[int | str, WindowPlacement]:
+    payload = load_settings_payload()
+    raw_placements = payload.get("window_positions")
+    if not isinstance(raw_placements, dict):
+        return {}
+
+    placements: dict[int | str, WindowPlacement] = {}
+    for raw_index, raw_placement in raw_placements.items():
+        camera_index = _camera_source_key(raw_index)
+        if camera_index is None:
+            continue
+        placement = WindowPlacement.from_payload(raw_placement)
+        if placement is not None:
+            placements[camera_index] = placement
+    return placements
+
+
+def save_window_placement(camera_index: int | str, placement: WindowPlacement) -> None:
+    source_key = _camera_source_key(camera_index)
+    if source_key is None:
+        return
+    payload = load_settings_payload()
+    raw_placements = payload.get("window_positions")
+    placements = dict(raw_placements) if isinstance(raw_placements, dict) else {}
+    placements[str(source_key)] = placement.to_payload()
+    payload["window_positions"] = placements
+    save_settings_payload(payload)
+
+
+def save_frame(frame, camera_index: int | str) -> Path:
     screenshot_dir = application_directory() / "screenshots"
     screenshot_dir.mkdir(exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    output_path = screenshot_dir / f"camera_{camera_index}_{timestamp}.jpg"
+    safe_camera_index = re.sub(r"[^A-Za-z0-9_-]+", "_", str(camera_index)).strip("_")
+    output_path = screenshot_dir / f"camera_{safe_camera_index or 'stream'}_{timestamp}.jpg"
     if not cv2.imwrite(str(output_path), frame):
         raise RuntimeError(f"Could not save {output_path}")
     return output_path
@@ -330,15 +870,18 @@ class CameraWindow:
         manager: "CameraManager",
         opened: OpenedCapture,
         position: int,
+        saved_placement: WindowPlacement | None = None,
     ) -> None:
         self.manager = manager
         self.capture = opened.capture
         self.camera_index = opened.index
         self.backend = opened.backend
+        self.camera_name = opened.display_name or f"\u6444\u50cf\u5934 {self.camera_index}"
+        self.frame_interval = 1.0 / max(1, min(manager.fps, 30))
         self.window = tk.Toplevel(manager.root)
-        self.window.title(f"{WINDOW_TITLE} - \u6444\u50cf\u5934 {self.camera_index}")
-        self.window.minsize(480, 360)
-        self.window.geometry(self._initial_geometry(position))
+        self.window.title(f"{WINDOW_TITLE} - {self.camera_name}")
+        self.window.minsize(MIN_WINDOW_WIDTH, MIN_WINDOW_HEIGHT)
+        self.window.geometry(self._initial_geometry(position, saved_placement))
         self.window.protocol("WM_DELETE_WINDOW", self.close)
 
         self.zoom_view = ZoomView()
@@ -355,26 +898,50 @@ class CameraWindow:
         self.image_bounds: tuple[int, int, int, int] | None = None
 
         self._build_ui()
+        self._draw_after_id: str | None = None
         self.reader = threading.Thread(
             target=self._read_frames,
             name=f"camera-reader-{self.camera_index}",
             daemon=True,
         )
         self.reader.start()
-        self.window.after(30, self._draw_frame)
+        self._draw_after_id = self.window.after(
+            self._display_interval_ms(), self._draw_frame
+        )
 
     @staticmethod
-    def _initial_geometry(position: int) -> str:
+    def _initial_geometry(
+        position: int, saved_placement: WindowPlacement | None = None
+    ) -> str:
+        if saved_placement is not None:
+            return (
+                f"{saved_placement.width}x{saved_placement.height}"
+                f"+{saved_placement.x}+{saved_placement.y}"
+            )
         column = position % 3
         row = position // 3
         left = 40 + column * 55
         top = 40 + row * 55
         return f"900x620+{left}+{top}"
 
+    def current_placement(self) -> WindowPlacement:
+        self.window.update_idletasks()
+        return WindowPlacement(
+            x=self.window.winfo_x(),
+            y=self.window.winfo_y(),
+            width=self.window.winfo_width(),
+            height=self.window.winfo_height(),
+        )
+
+    def _display_interval_ms(self) -> int:
+        if len(self.manager.windows) > 1:
+            return MULTI_CAMERA_DISPLAY_INTERVAL_MS
+        return DISPLAY_INTERVAL_MS
+
     def _build_ui(self) -> None:
         toolbar = ttk.Frame(self.window, padding=(8, 6))
         toolbar.pack(fill=tk.X)
-        ttk.Label(toolbar, text=f"\u6444\u50cf\u5934 {self.camera_index}").pack(side=tk.LEFT)
+        ttk.Label(toolbar, text=self.camera_name).pack(side=tk.LEFT)
         self.zoom_label = ttk.Label(toolbar, text="\u7f29\u653e x1.0")
         self.zoom_label.pack(side=tk.LEFT, padx=(14, 0))
         self.fps_label = ttk.Label(toolbar, text="0.0 FPS")
@@ -390,6 +957,11 @@ class CameraWindow:
         ttk.Button(toolbar, text="\u626b\u63cf", command=self.manager.scan_for_cameras).pack(
             side=tk.RIGHT, padx=(0, 6)
         )
+        ttk.Button(
+            toolbar,
+            text="\u7f51\u7edc",
+            command=lambda: self.manager.open_network_camera_dialog(self.window),
+        ).pack(side=tk.RIGHT, padx=(0, 6))
         ttk.Button(
             toolbar,
             text="\u5feb\u6377\u952e",
@@ -424,7 +996,9 @@ class CameraWindow:
     def _read_frames(self) -> None:
         failed_reads = 0
         while self.running:
+            read_started = time.perf_counter()
             ok, frame = self.capture.read()
+            read_elapsed = time.perf_counter() - read_started
             if not ok:
                 failed_reads += 1
                 if failed_reads >= 30:
@@ -436,6 +1010,8 @@ class CameraWindow:
             with self.frame_lock:
                 self.latest_frame = frame
                 self.frame_count += 1
+            if read_elapsed < self.frame_interval:
+                time.sleep(self.frame_interval - read_elapsed)
 
     def _take_latest_frame(self):
         with self.frame_lock:
@@ -465,15 +1041,30 @@ class CameraWindow:
         return left, top, display_width, display_height
 
     @staticmethod
-    def _to_photo(frame, master=None):
-        # OpenCV converts BGR frames to PNG's RGB channel order when encoding.
-        ok, encoded = cv2.imencode(".png", frame, [cv2.IMWRITE_PNG_COMPRESSION, 1])
-        if not ok:
-            raise RuntimeError("Could not encode camera frame for display.")
-        encoded_base64 = base64.b64encode(encoded.tobytes()).decode("ascii")
-        return tk.PhotoImage(master=master, data=encoded_base64, format="png")
+    def _to_image(frame) -> Image.Image:
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        return Image.fromarray(rgb_frame)
+
+    @classmethod
+    def _to_photo(cls, frame, master=None):
+        return ImageTk.PhotoImage(cls._to_image(frame), master=master)
+
+    def _update_photo(self, frame) -> None:
+        image = self._to_image(frame)
+        width, height = image.size
+        if (
+            self.image_photo is None
+            or self.image_photo.width() != width
+            or self.image_photo.height() != height
+        ):
+            self.image_photo = ImageTk.PhotoImage(image, master=self.window)
+            self.canvas.itemconfigure(self.image_id, image=self.image_photo)
+        else:
+            # Reusing the Tk image prevents allocation churn for every frame.
+            self.image_photo.paste(image)
 
     def _draw_frame(self) -> None:
+        self._draw_after_id = None
         if not self.running:
             return
 
@@ -483,8 +1074,7 @@ class CameraWindow:
             source_height, source_width = frame.shape[:2]
             left, top, display_width, display_height = self._display_size(source_width, source_height)
             display_frame = self.zoom_view.render(frame, display_width, display_height)
-            self.image_photo = self._to_photo(display_frame, self.window)
-            self.canvas.itemconfigure(self.image_id, image=self.image_photo)
+            self._update_photo(display_frame)
             self.canvas.coords(self.image_id, left, top)
             self.canvas.tag_lower(self.image_id)
             self.image_bounds = (left, top, display_width, display_height)
@@ -495,7 +1085,9 @@ class CameraWindow:
 
         self.canvas.itemconfigure(self.message_id, text=self.status_text)
         try:
-            self.window.after(30, self._draw_frame)
+            self._draw_after_id = self.window.after(
+                self._display_interval_ms(), self._draw_frame
+            )
         except tk.TclError:
             pass
 
@@ -541,6 +1133,13 @@ class CameraWindow:
         if not self.running:
             return
         self.running = False
+        if self._draw_after_id is not None:
+            try:
+                self.window.after_cancel(self._draw_after_id)
+            except tk.TclError:
+                pass
+            self._draw_after_id = None
+        self.manager.remember_window_placement(self)
         try:
             self.capture.release()
         finally:
@@ -570,8 +1169,14 @@ class CameraManager:
         self.root = tk.Tk()
         self.root.withdraw()
         self.root.protocol("WM_DELETE_WINDOW", self.close_all)
-        self.windows: dict[int, CameraWindow] = {}
+        self.windows: dict[int | str, CameraWindow] = {}
+        self.window_placements = load_window_placements()
+        self._show_launcher_when_empty = not captures
+        self.launcher_window: tk.Toplevel | None = None
+        self._network_dialog_cleanups: set = set()
         self.shutting_down = False
+        self._hotkey_poll_after_id: str | None = None
+        self._close_after_id: str | None = None
         self.previews_hidden = False
         self.hotkey = load_hotkey()
         self._hotkey_events = queue.SimpleQueue()
@@ -581,21 +1186,118 @@ class CameraManager:
         self._hotkey_thread_id: int | None = None
         self.hotkey_available = False
         self._start_hotkey_listener()
-        self.root.after(80, self._poll_hotkey_events)
+        self._hotkey_poll_after_id = self.root.after(80, self._poll_hotkey_events)
 
         for position, opened in enumerate(captures):
             self.add_camera(opened, position)
 
-    def add_camera(self, opened: OpenedCapture, position: int | None = None) -> None:
+        if not self.windows:
+            self.show_launcher()
+
+    def add_camera(self, opened: OpenedCapture, position: int | None = None) -> bool:
         if opened.index in self.windows:
             opened.capture.release()
-            return
+            return False
         if position is None:
             position = len(self.windows)
-        window = CameraWindow(self, opened, position)
+        window = CameraWindow(
+            self,
+            opened,
+            position,
+            self.window_placements.get(opened.index),
+        )
         self.windows[opened.index] = window
+        self._apply_capture_performance_profile()
+        self.hide_launcher()
         if self.previews_hidden:
             window.window.withdraw()
+        return True
+
+    def _apply_capture_performance_profile(self) -> None:
+        target_fps = self.fps
+        if len(self.windows) > 1:
+            target_fps = min(target_fps, MULTI_CAMERA_FPS)
+        frame_interval = 1.0 / max(1, target_fps)
+        for window in self.windows.values():
+            window.frame_interval = frame_interval
+
+    def remember_window_placement(self, window: CameraWindow) -> None:
+        try:
+            placement = window.current_placement()
+        except tk.TclError:
+            return
+
+        self.window_placements[window.camera_index] = placement
+        try:
+            save_window_placement(window.camera_index, placement)
+        except OSError:
+            pass
+
+    def show_launcher(self) -> None:
+        if self.shutting_down:
+            return
+        if self.launcher_window is not None:
+            try:
+                if self.launcher_window.winfo_exists():
+                    self.launcher_window.deiconify()
+                    self.launcher_window.lift()
+                    self.launcher_window.focus_force()
+                    return
+            except tk.TclError:
+                pass
+            self.launcher_window = None
+
+        launcher = tk.Toplevel(self.root)
+        self.launcher_window = launcher
+        launcher.title(WINDOW_TITLE)
+        launcher.resizable(False, False)
+        launcher.protocol("WM_DELETE_WINDOW", self.close_all)
+
+        container = ttk.Frame(launcher, padding=18)
+        container.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(container, text=WINDOW_TITLE, font=("Segoe UI", 14)).pack(
+            anchor=tk.W, pady=(0, 14)
+        )
+        ttk.Button(
+            container,
+            text="\u626b\u63cf USB \u6444\u50cf\u5934",
+            command=self.scan_for_cameras,
+        ).pack(fill=tk.X)
+        ttk.Button(
+            container,
+            text="\u67e5\u627e\u7f51\u7edc\u6444\u50cf\u5934",
+            command=lambda: self.open_network_camera_dialog(launcher),
+        ).pack(fill=tk.X, pady=(8, 0))
+        ttk.Button(container, text="\u9000\u51fa", command=self.close_all).pack(
+            fill=tk.X, pady=(8, 0)
+        )
+        launcher.geometry("360x190")
+        launcher.after_idle(lambda: self._center_window(launcher, self.root))
+
+    def hide_launcher(self) -> None:
+        if self.launcher_window is None:
+            return
+        try:
+            if self.launcher_window.winfo_exists():
+                self.launcher_window.withdraw()
+        except tk.TclError:
+            self.launcher_window = None
+
+    @staticmethod
+    def _center_window(dialog, parent) -> None:
+        try:
+            dialog.update_idletasks()
+            screen_width = dialog.winfo_screenwidth()
+            screen_height = dialog.winfo_screenheight()
+            left = max(0, (screen_width - dialog.winfo_width()) // 2)
+            top = max(0, (screen_height - dialog.winfo_height()) // 2)
+            if parent.winfo_viewable():
+                left = max(0, parent.winfo_rootx() + (parent.winfo_width() - dialog.winfo_width()) // 2)
+                top = max(0, parent.winfo_rooty() + (parent.winfo_height() - dialog.winfo_height()) // 2)
+            dialog.geometry(f"+{left}+{top}")
+            dialog.lift()
+        except tk.TclError:
+            pass
 
     def _start_hotkey_listener(self) -> None:
         if sys.platform != "win32":
@@ -635,6 +1337,7 @@ class CameraManager:
             self.hotkey_available = False
 
     def _poll_hotkey_events(self) -> None:
+        self._hotkey_poll_after_id = None
         pressed = False
         while True:
             try:
@@ -646,7 +1349,7 @@ class CameraManager:
             self.toggle_visibility()
         if not self.shutting_down:
             try:
-                self.root.after(80, self._poll_hotkey_events)
+                self._hotkey_poll_after_id = self.root.after(80, self._poll_hotkey_events)
             except tk.TclError:
                 pass
 
@@ -783,6 +1486,258 @@ class CameraManager:
 
         dialog.after_idle(position_dialog)
 
+    def open_network_camera_dialog(self, parent) -> None:
+        if self.shutting_down:
+            return
+
+        dialog = tk.Toplevel(parent)
+        dialog.title("\u7f51\u7edc\u6444\u50cf\u5934")
+        dialog.transient(parent)
+        dialog.geometry("780x500")
+        dialog.minsize(680, 430)
+        dialog.grab_set()
+
+        container = ttk.Frame(dialog, padding=14)
+        container.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(container, text="ONVIF \u8bbe\u5907").pack(anchor=tk.W)
+
+        devices_frame = ttk.Frame(container)
+        devices_frame.pack(fill=tk.BOTH, expand=True, pady=(6, 10))
+        tree = ttk.Treeview(
+            devices_frame,
+            columns=("name", "host", "endpoint"),
+            show="headings",
+            height=9,
+        )
+        tree.heading("name", text="\u8bbe\u5907")
+        tree.heading("host", text="IP \u5730\u5740")
+        tree.heading("endpoint", text="ONVIF \u5730\u5740")
+        tree.column("name", width=190, minwidth=140, stretch=False)
+        tree.column("host", width=130, minwidth=100, stretch=False)
+        tree.column("endpoint", width=390, minwidth=260, stretch=True)
+        scrollbar = ttk.Scrollbar(devices_frame, orient=tk.VERTICAL, command=tree.yview)
+        tree.configure(yscrollcommand=scrollbar.set)
+        tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        credentials = ttk.Frame(container)
+        credentials.pack(fill=tk.X)
+        ttk.Label(credentials, text="\u7528\u6237\u540d").grid(row=0, column=0, sticky=tk.W)
+        username_var = tk.StringVar()
+        ttk.Entry(credentials, textvariable=username_var, width=20).grid(
+            row=0, column=1, sticky=tk.EW, padx=(6, 14)
+        )
+        ttk.Label(credentials, text="\u5bc6\u7801").grid(row=0, column=2, sticky=tk.W)
+        password_var = tk.StringVar()
+        ttk.Entry(credentials, textvariable=password_var, width=20, show="*").grid(
+            row=0, column=3, sticky=tk.EW, padx=(6, 0)
+        )
+        credentials.columnconfigure(1, weight=1)
+        credentials.columnconfigure(3, weight=1)
+
+        stream_row = ttk.Frame(container)
+        stream_row.pack(fill=tk.X, pady=(10, 0))
+        ttk.Label(stream_row, text="RTSP \u5730\u5740").pack(side=tk.LEFT)
+        stream_url_var = tk.StringVar()
+        stream_selector = ttk.Combobox(
+            stream_row,
+            textvariable=stream_url_var,
+            state="normal",
+        )
+        stream_selector.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 0))
+
+        status_var = tk.StringVar(value="\u70b9\u51fb\u641c\u7d22\u53d1\u73b0\u5c40\u57df\u7f51 ONVIF \u6444\u50cf\u5934\u3002")
+        ttk.Label(container, textvariable=status_var).pack(anchor=tk.W, pady=(8, 0))
+
+        buttons = ttk.Frame(container)
+        buttons.pack(fill=tk.X, pady=(10, 0))
+        search_button = ttk.Button(buttons, text="\u641c\u7d22", command=lambda: None)
+        search_button.pack(side=tk.LEFT)
+        resolve_button = ttk.Button(buttons, text="\u8bfb\u53d6 RTSP", command=lambda: None)
+        resolve_button.pack(side=tk.LEFT, padx=(6, 0))
+        connect_button = ttk.Button(buttons, text="\u6dfb\u52a0\u9884\u89c8", command=lambda: None)
+        connect_button.pack(side=tk.RIGHT)
+        cancel_button = ttk.Button(buttons, text="\u5173\u95ed", command=lambda: None)
+        cancel_button.pack(side=tk.RIGHT, padx=(0, 6))
+
+        discovered_by_item: dict[str, DiscoveredNetworkCamera] = {}
+        event_queue: queue.SimpleQueue = queue.SimpleQueue()
+        active_operation: list[str | None] = [None]
+        dialog_open = [True]
+        poll_after_id: list[str | None] = [None]
+        state_lock = threading.Lock()
+
+        def selected_camera() -> DiscoveredNetworkCamera | None:
+            selection = tree.selection()
+            if not selection:
+                return None
+            return discovered_by_item.get(selection[0])
+
+        def set_busy(busy: bool) -> None:
+            state = tk.DISABLED if busy else tk.NORMAL
+            for button in (search_button, resolve_button, connect_button):
+                button.configure(state=state)
+
+        def release_connect_result(result: object) -> None:
+            if isinstance(result, OpenedCapture):
+                result.capture.release()
+
+        def cleanup_dialog() -> None:
+            releases: list[object] = []
+            with state_lock:
+                if not dialog_open[0]:
+                    return
+                dialog_open[0] = False
+                while True:
+                    try:
+                        operation, succeeded, result = event_queue.get_nowait()
+                    except queue.Empty:
+                        break
+                    if operation == "connect" and succeeded:
+                        releases.append(result)
+            self._network_dialog_cleanups.discard(cleanup_dialog)
+            if poll_after_id[0] is not None:
+                try:
+                    dialog.after_cancel(poll_after_id[0])
+                except tk.TclError:
+                    pass
+                poll_after_id[0] = None
+            for result in releases:
+                release_connect_result(result)
+
+        def close_dialog() -> None:
+            cleanup_dialog()
+            try:
+                dialog.grab_release()
+                dialog.destroy()
+            except tk.TclError:
+                pass
+
+        def on_dialog_destroy(event) -> None:
+            if event.widget is dialog:
+                cleanup_dialog()
+
+        def start_operation(operation: str, status: str, action) -> None:
+            if active_operation[0] is not None:
+                return
+            active_operation[0] = operation
+            set_busy(True)
+            status_var.set(status)
+
+            def worker() -> None:
+                try:
+                    result = action()
+                except Exception as error:
+                    with state_lock:
+                        if dialog_open[0]:
+                            event_queue.put((operation, False, str(error)))
+                    return
+                should_release = False
+                with state_lock:
+                    if dialog_open[0]:
+                        event_queue.put((operation, True, result))
+                    elif operation == "connect":
+                        should_release = True
+                if should_release:
+                    release_connect_result(result)
+
+            threading.Thread(
+                target=worker,
+                name=f"network-camera-{operation}",
+                daemon=True,
+            ).start()
+
+        def search_network() -> None:
+            start_operation(
+                "discover",
+                "\u6b63\u5728\u641c\u7d22\u5c40\u57df\u7f51 ONVIF \u6444\u50cf\u5934...",
+                discover_network_cameras,
+            )
+
+        def resolve_stream() -> None:
+            camera = selected_camera()
+            if camera is None:
+                status_var.set("\u8bf7\u5148\u5728\u5217\u8868\u4e2d\u9009\u62e9\u4e00\u53f0\u8bbe\u5907\u3002")
+                return
+            username = username_var.get().strip()
+            password = password_var.get()
+            start_operation(
+                "resolve",
+                "\u6b63\u5728\u8bfb\u53d6 ONVIF \u89c6\u9891\u6d41\u5730\u5740...",
+                lambda: resolve_onvif_stream_urls(camera, username, password),
+            )
+
+        def connect_stream() -> None:
+            try:
+                stream_url = normalize_network_stream_url(stream_url_var.get())
+            except ValueError as error:
+                status_var.set(str(error))
+                return
+            start_operation(
+                "connect",
+                "\u6b63\u5728\u8fde\u63a5\u7f51\u7edc\u6444\u50cf\u5934...",
+                lambda: open_network_capture(stream_url),
+            )
+
+        def handle_events() -> None:
+            poll_after_id[0] = None
+            try:
+                while True:
+                    operation, succeeded, result = event_queue.get_nowait()
+                    active_operation[0] = None
+                    set_busy(False)
+                    if not succeeded:
+                        status_var.set(str(result))
+                        continue
+                    if operation == "discover":
+                        cameras = result
+                        existing_items = tree.get_children()
+                        if existing_items:
+                            tree.delete(*existing_items)
+                        discovered_by_item.clear()
+                        for index, camera in enumerate(cameras):
+                            item_id = f"camera-{index}"
+                            discovered_by_item[item_id] = camera
+                            tree.insert(
+                                "",
+                                tk.END,
+                                iid=item_id,
+                                values=(camera.display_name, camera.host, camera.endpoint),
+                            )
+                        if cameras:
+                            status_var.set(f"\u627e\u5230 {len(cameras)} \u53f0 ONVIF \u8bbe\u5907\u3002")
+                        else:
+                            status_var.set("\u672a\u627e\u5230 ONVIF \u8bbe\u5907\u3002\u8bf7\u786e\u8ba4\u8bbe\u5907\u4e0e\u7535\u8111\u5904\u4e8e\u540c\u4e00\u5c40\u57df\u7f51\u3002")
+                    elif operation == "resolve":
+                        stream_urls = result
+                        stream_selector.configure(values=stream_urls)
+                        stream_url_var.set(stream_urls[0])
+                        status_var.set(f"\u5df2\u8bfb\u53d6 {len(stream_urls)} \u4e2a RTSP \u89c6\u9891\u6d41\u3002")
+                    elif operation == "connect":
+                        opened = result
+                        if self.add_camera(opened):
+                            status_var.set("\u5df2\u6dfb\u52a0\u7f51\u7edc\u6444\u50cf\u5934\u3002")
+                            close_dialog()
+                        else:
+                            status_var.set("\u8fd9\u4e2a\u7f51\u7edc\u6444\u50cf\u5934\u5df2\u7ecf\u6253\u5f00\u3002")
+            except queue.Empty:
+                pass
+            try:
+                if dialog_open[0] and dialog.winfo_exists():
+                    poll_after_id[0] = dialog.after(80, handle_events)
+            except tk.TclError:
+                pass
+
+        search_button.configure(command=search_network)
+        resolve_button.configure(command=resolve_stream)
+        connect_button.configure(command=connect_stream)
+        cancel_button.configure(command=close_dialog)
+        self._network_dialog_cleanups.add(cleanup_dialog)
+        dialog.bind("<Destroy>", on_dialog_destroy)
+        dialog.protocol("WM_DELETE_WINDOW", close_dialog)
+        poll_after_id[0] = dialog.after(80, handle_events)
+        dialog.after_idle(lambda: self._center_window(dialog, parent))
+
     def scan_for_cameras(self) -> None:
         if self.shutting_down:
             return
@@ -805,14 +1760,35 @@ class CameraManager:
     def camera_closed(self, window: CameraWindow) -> None:
         if self.windows.get(window.camera_index) is window:
             del self.windows[window.camera_index]
+        self._apply_capture_performance_profile()
         if not self.windows and not self.shutting_down:
-            self.root.after_idle(self.close_all)
+            if self._show_launcher_when_empty:
+                self.show_launcher()
+            else:
+                self._close_after_id = self.root.after_idle(self.close_all)
 
     def close_all(self) -> None:
         if self.shutting_down:
             return
         self.shutting_down = True
+        for callback_id in (self._hotkey_poll_after_id, self._close_after_id):
+            if callback_id is None:
+                continue
+            try:
+                self.root.after_cancel(callback_id)
+            except tk.TclError:
+                pass
+        self._hotkey_poll_after_id = None
+        self._close_after_id = None
         self._stop_hotkey_listener()
+        for cleanup_dialog in tuple(self._network_dialog_cleanups):
+            cleanup_dialog()
+        if self.launcher_window is not None:
+            try:
+                self.launcher_window.destroy()
+            except tk.TclError:
+                pass
+            self.launcher_window = None
         for window in list(self.windows.values()):
             window.close(notify_manager=False)
         self.windows.clear()
@@ -869,10 +1845,26 @@ def main() -> int:
     indices: Iterable[int] = range(args.max_index + 1) if scan_all else args.camera
     captures = open_captures(indices, args.width, args.height, args.fps)
     if not captures:
-        if scan_all:
+        if not scan_all:
+            requested = ", ".join(str(index) for index in args.camera)
+            raise RuntimeError(f"Cannot open requested camera(s): {requested}")
+        if args.self_test:
             raise RuntimeError("No usable camera was found.")
-        requested = ", ".join(str(index) for index in args.camera)
-        raise RuntimeError(f"Cannot open requested camera(s): {requested}")
+        return show_previews([], args.width, args.height, args.fps, args.max_index)
+
+    if len(captures) > 1 and args.fps > MULTI_CAMERA_FPS:
+        expected_count = len(captures)
+        for opened in captures:
+            opened.capture.release()
+        time.sleep(0.2)
+        captures = open_captures(
+            indices, args.width, args.height, MULTI_CAMERA_FPS
+        )
+        if len(captures) < expected_count:
+            for opened in captures:
+                opened.capture.release()
+            time.sleep(0.2)
+            captures = open_captures(indices, args.width, args.height, args.fps)
 
     try:
         for opened in captures:
