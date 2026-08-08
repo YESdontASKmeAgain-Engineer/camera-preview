@@ -1,11 +1,13 @@
 # Camera Preview
 
-A lightweight Windows desktop application for viewing a UVC camera feed.
+A lightweight Windows desktop application for viewing UVC and ONVIF camera feeds.
 
 ## Features
 
 - Simultaneous previews for all connected Windows UVC cameras
 - One movable and resizable desktop window for each camera
+- Restores each camera window's last screen position and size after reopening
+- Local-network ONVIF camera discovery, RTSP address lookup, and manual RTSP connection
 - Mouse-wheel zoom centered on the cursor
 - Standard Windows close button, plus keyboard shortcuts
 - Screenshot capture
@@ -16,7 +18,7 @@ A lightweight Windows desktop application for viewing a UVC camera feed.
 
 - Windows 10 or newer
 - Python 3.10 or newer
-- A UVC-compatible USB camera
+- A UVC-compatible USB camera or an ONVIF/RTSP network camera
 
 ## Run From Source
 
@@ -35,6 +37,12 @@ By default, the application scans for all usable cameras and opens one window
 per camera. Drag a window's title bar to place that feed anywhere on the
 desktop. Use the `Scan` button after connecting another camera while the
 application is already running.
+
+Use the Network button to search for ONVIF cameras on the local network. Select a
+device, enter its credentials if required, and choose Read RTSP to fill the stream
+address automatically. A known RTSP address can also be pasted directly and opened with
+Add Preview. When no USB camera is available, the application opens a small
+launcher with the same network-search action.
 
 To open only selected cameras, repeat `--camera`:
 
