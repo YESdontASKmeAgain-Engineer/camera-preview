@@ -7,6 +7,8 @@ A lightweight Windows desktop application for viewing UVC and ONVIF camera feeds
 - Simultaneous previews for all connected Windows UVC cameras in one shared window
 - Drag each camera panel by its top bar to arrange feeds anywhere in the workspace
 - Restores the main window location and each camera panel location after reopening
+- Always-on-top mode keeps the preview visible while switching applications
+- Pure-picture mode hides the app border, toolbar, and camera panel controls
 - Local-network ONVIF camera discovery, RTSP address lookup, and manual RTSP connection
 - Mouse-wheel zoom centered on the cursor
 - Standard Windows close button, plus keyboard shortcuts
@@ -61,6 +63,8 @@ python camera_preview.py --camera 0 --camera 1
 | `Esc` or `Q` | Close the application |
 | `Ctrl` + `H` | Globally hide or restore all preview windows |
 | `\u5feb\u6377\u952e` button | Set a different `Ctrl` + key global hide/show hotkey |
+| `\u53d6\u6d88\u7f6e\u9876` / `\u7f6e\u9876` | Keep the preview above other applications or disable it |
+| `\u7eaf\u753b\u9762` | Hide the app border and controls; right-click a preview to restore them |
 
 Screenshots are saved in a `screenshots` folder beside the running application.
 
