@@ -36,10 +36,13 @@ Use `--list` to find usable camera indexes:
 python camera_preview.py --list
 ```
 
-By default, the application scans for all usable cameras and opens them in one
-shared preview window. Drag a camera panel's top bar to place that feed anywhere
-inside the workspace. Use the `Scan` button after connecting another camera while
-the application is already running.
+By default, the application scans for usable cameras and opens the only camera
+it finds. When multiple local cameras are available, a selection window opens
+with the first camera selected; choose one or more cameras to display. Use
+`--all` to skip that selection and open every usable camera. Drag a camera
+panel's top bar to place that feed anywhere inside the workspace. Use the
+`Scan` button after connecting another camera while the application is already
+running.
 
 Use the Network button to search for ONVIF cameras on the local network. Select a
 device, enter its credentials if required, and choose Read RTSP to fill the stream
@@ -62,7 +65,9 @@ python camera_preview.py --camera 0 --camera 1
 | `S` | Save a screenshot |
 | `F` or `F11` | Toggle full screen |
 | `Esc` or `Q` | Close the application |
-| `Ctrl` + `H` | Globally hide or restore all preview windows |
+| `Ctrl` + `N` | Switch to the next available local camera |
+| `Ctrl` + `P` | Switch to the previous available local camera |
+| `Ctrl` + `E` | Globally hide or restore all preview windows |
 | `\u5feb\u6377\u952e` button | Set a different `Ctrl` + key global hide/show hotkey |
 | `\u53d6\u6d88\u7f6e\u9876` / `\u7f6e\u9876` | Keep the preview above other applications or disable it |
 | `\u7eaf\u753b\u9762` | Hide the app border and controls; right-click a preview to restore them |
