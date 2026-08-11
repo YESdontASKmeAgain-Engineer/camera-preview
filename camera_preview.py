@@ -841,9 +841,15 @@ def select_local_captures(
     dialog.bind("<Escape>", lambda _event: cancel())
     dialog.protocol("WM_DELETE_WINDOW", cancel)
     dialog.grab_set()
+    dialog.deiconify()
+    dialog.lift()
+    dialog.focus_force()
 
     def center_dialog() -> None:
         try:
+            dialog.deiconify()
+            dialog.lift()
+            dialog.focus_force()
             dialog.update_idletasks()
             left = max(0, (dialog.winfo_screenwidth() - dialog.winfo_width()) // 2)
             top = max(0, (dialog.winfo_screenheight() - dialog.winfo_height()) // 2)
@@ -1920,6 +1926,9 @@ class CameraManager:
             fill=tk.X, pady=(8, 0)
         )
         launcher.geometry("360x190")
+        launcher.deiconify()
+        launcher.lift()
+        launcher.focus_force()
         launcher.after_idle(lambda: self._center_window(launcher, self.root))
 
     def hide_launcher(self) -> None:
