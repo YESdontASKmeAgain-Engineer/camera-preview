@@ -71,6 +71,9 @@ HOTKEY_SETTINGS_FILENAME = "camera_preview_settings.json"
 TK_SHIFT_MASK = 0x0001
 TK_CONTROL_MASK = 0x0004
 TK_ALT_MASK = 0x0008
+ERROR_ALREADY_EXISTS = 183
+SINGLE_INSTANCE_MUTEX_NAME = r"Local\CameraPreview-7F0D4E7E-9A77-4D08-9807-9B0F8B8E33E1"
+_single_instance_mutex = None
 
 SPECIAL_KEY_LABELS = {
     0x08: "Backspace",
@@ -904,6 +907,31 @@ def application_directory() -> Path:
     return Path(__file__).resolve().parent
 
 
+def acquire_single_instance() -> bool:
+    """Keep another GUI instance from silently taking over the cameras."""
+    global _single_instance_mutex
+    if sys.platform != "win32":
+        return True
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    create_mutex = kernel32.CreateMutexW
+    create_mutex.argtypes = (wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR)
+    create_mutex.restype = wintypes.HANDLE
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = (wintypes.HANDLE,)
+    close_handle.restype = wintypes.BOOL
+
+    mutex = create_mutex(None, False, SINGLE_INSTANCE_MUTEX_NAME)
+    if not mutex:
+        return True
+    if ctypes.get_last_error() == ERROR_ALREADY_EXISTS:
+        close_handle(mutex)
+        return False
+
+    _single_instance_mutex = mutex
+    return True
+
+
 def hotkey_settings_path() -> Path:
     return application_directory() / HOTKEY_SETTINGS_FILENAME
 
@@ -1477,6 +1505,11 @@ class CameraManager:
         self.borderless_button: ttk.Button | None = None
         self._show_launcher_when_empty = not captures
         self.launcher_window: tk.Toplevel | None = None
+        self.launcher_scan_button: ttk.Button | None = None
+        self.launcher_status_var: tk.StringVar | None = None
+        self._local_scan_events = queue.SimpleQueue()
+        self._local_scan_poll_after_id: str | None = None
+        self._local_scan_running = False
         self._network_dialog_cleanups: set = set()
         self.shutting_down = False
         self._hotkey_poll_after_id: str | None = None
@@ -1912,11 +1945,12 @@ class CameraManager:
         ttk.Label(container, text=WINDOW_TITLE, font=("Segoe UI", 14)).pack(
             anchor=tk.W, pady=(0, 14)
         )
-        ttk.Button(
+        self.launcher_scan_button = ttk.Button(
             container,
             text="\u626b\u63cf USB \u6444\u50cf\u5934",
             command=self.scan_for_cameras,
-        ).pack(fill=tk.X)
+        )
+        self.launcher_scan_button.pack(fill=tk.X)
         ttk.Button(
             container,
             text="\u67e5\u627e\u7f51\u7edc\u6444\u50cf\u5934",
@@ -1925,7 +1959,16 @@ class CameraManager:
         ttk.Button(container, text="\u9000\u51fa", command=self.close_all).pack(
             fill=tk.X, pady=(8, 0)
         )
-        launcher.geometry("360x190")
+        self.launcher_status_var = tk.StringVar(
+            value="\u70b9\u51fb\u201c\u626b\u63cf USB \u6444\u50cf\u5934\u201d\u5f00\u59cb\u3002"
+        )
+        ttk.Label(
+            container,
+            textvariable=self.launcher_status_var,
+            justify=tk.LEFT,
+            wraplength=324,
+        ).pack(fill=tk.X, pady=(12, 0))
+        launcher.geometry("360x230")
         launcher.deiconify()
         launcher.lift()
         launcher.focus_force()
@@ -1939,6 +1982,16 @@ class CameraManager:
                 self.launcher_window.withdraw()
         except tk.TclError:
             self.launcher_window = None
+
+    def _set_launcher_status(self, message: str) -> None:
+        if self.launcher_status_var is not None:
+            self.launcher_status_var.set(message)
+        if self.launcher_window is not None:
+            try:
+                if self.launcher_window.winfo_exists():
+                    self.launcher_window.update_idletasks()
+            except tk.TclError:
+                self.launcher_window = None
 
     @staticmethod
     def _center_window(dialog, parent) -> None:
@@ -2394,34 +2447,110 @@ class CameraManager:
         dialog.after_idle(lambda: self._center_window(dialog, parent))
 
     def scan_for_cameras(self) -> None:
-        if self.shutting_down:
+        if self.shutting_down or self._local_scan_running:
             return
         known_indices = set(self.windows)
         local_camera_count = sum(
             isinstance(camera_index, int) for camera_index in known_indices
         )
-        added = 0
-        for index in range(self.max_index + 1):
-            if index in known_indices:
-                continue
-            use_multi_profile = local_camera_count >= 1
-            width = min(self.width, MULTI_CAMERA_WIDTH) if use_multi_profile else self.width
-            height = (
-                min(self.height, MULTI_CAMERA_HEIGHT) if use_multi_profile else self.height
-            )
-            fps = min(self.fps, MULTI_CAMERA_FPS) if use_multi_profile else self.fps
-            fourcc = MULTI_CAMERA_FOURCC if use_multi_profile else self.capture_fourcc
-            try:
-                opened = open_capture(index, width, height, fps, fourcc)
-            except RuntimeError:
-                continue
-            if self.add_camera(opened):
-                local_camera_count += 1
-                if local_camera_count > 1:
-                    self._switch_local_captures_to_multi_profile()
-                added += 1
+        self._local_scan_running = True
+        if self.launcher_scan_button is not None:
+            self.launcher_scan_button.configure(state=tk.DISABLED)
+        self._set_launcher_status(
+            "\u6b63\u5728\u626b\u63cf USB \u6444\u50cf\u5934\uff0c\u8bf7\u7a0d\u5019\u2026"
+        )
 
-        message = "No new cameras found." if not added else f"Added {added} camera(s)."
+        def worker() -> None:
+            opened_captures: list[OpenedCapture] = []
+            scan_local_camera_count = local_camera_count
+            try:
+                for index in range(self.max_index + 1):
+                    if index in known_indices:
+                        continue
+                    use_multi_profile = scan_local_camera_count >= 1
+                    width = (
+                        min(self.width, MULTI_CAMERA_WIDTH)
+                        if use_multi_profile
+                        else self.width
+                    )
+                    height = (
+                        min(self.height, MULTI_CAMERA_HEIGHT)
+                        if use_multi_profile
+                        else self.height
+                    )
+                    fps = (
+                        min(self.fps, MULTI_CAMERA_FPS)
+                        if use_multi_profile
+                        else self.fps
+                    )
+                    fourcc = (
+                        MULTI_CAMERA_FOURCC
+                        if use_multi_profile
+                        else self.capture_fourcc
+                    )
+                    try:
+                        opened = open_capture(index, width, height, fps, fourcc)
+                    except RuntimeError:
+                        continue
+                    opened_captures.append(opened)
+                    scan_local_camera_count += 1
+            except Exception as error:
+                for opened in opened_captures:
+                    opened.capture.release()
+                self._local_scan_events.put(([], str(error)))
+            else:
+                self._local_scan_events.put((opened_captures, None))
+
+        threading.Thread(
+            target=worker,
+            name="camera-preview-local-scan",
+            daemon=True,
+        ).start()
+        self._local_scan_poll_after_id = self.root.after(80, self._poll_local_scan_events)
+
+    def _poll_local_scan_events(self) -> None:
+        self._local_scan_poll_after_id = None
+        try:
+            opened_captures, error = self._local_scan_events.get_nowait()
+        except queue.Empty:
+            if self._local_scan_running and not self.shutting_down:
+                self._local_scan_poll_after_id = self.root.after(
+                    80, self._poll_local_scan_events
+                )
+            return
+
+        added = 0
+        local_camera_count = sum(
+            isinstance(camera_index, int) for camera_index in self.windows
+        )
+        for opened in opened_captures:
+            if self.shutting_down:
+                opened.capture.release()
+                continue
+            if not self.add_camera(opened):
+                continue
+            local_camera_count += 1
+            if local_camera_count > 1:
+                self._switch_local_captures_to_multi_profile()
+            added += 1
+
+        self._local_scan_running = False
+        if self.launcher_scan_button is not None:
+            try:
+                self.launcher_scan_button.configure(state=tk.NORMAL)
+            except tk.TclError:
+                self.launcher_scan_button = None
+
+        if error:
+            message = f"\u626b\u63cf\u5931\u8d25\uff1a{error}"
+        elif added:
+            message = f"\u5df2\u627e\u5230\u5e76\u6253\u5f00 {added} \u53f0 USB \u6444\u50cf\u5934\u3002"
+        else:
+            message = (
+                "\u672a\u627e\u5230\u53ef\u7528\u7684 USB \u6444\u50cf\u5934\u3002"
+                "\u8bf7\u68c0\u67e5\u8fde\u63a5\uff0c\u5e76\u5173\u95ed\u5360\u7528\u6444\u50cf\u5934\u7684\u5176\u4ed6\u7a0b\u5e8f\u3002"
+            )
+        self._set_launcher_status(message)
         for window in self.windows.values():
             window.set_status(message)
 
@@ -2443,7 +2572,11 @@ class CameraManager:
             return
         self.shutting_down = True
         self.remember_main_window_placement()
-        for callback_id in (self._hotkey_poll_after_id, self._close_after_id):
+        for callback_id in (
+            self._hotkey_poll_after_id,
+            self._close_after_id,
+            self._local_scan_poll_after_id,
+        ):
             if callback_id is None:
                 continue
             try:
@@ -2452,6 +2585,8 @@ class CameraManager:
                 pass
         self._hotkey_poll_after_id = None
         self._close_after_id = None
+        self._local_scan_poll_after_id = None
+        self._local_scan_running = False
         self._stop_hotkey_listener()
         for cleanup_dialog in tuple(self._network_dialog_cleanups):
             cleanup_dialog()
@@ -2534,6 +2669,12 @@ def main() -> int:
         raise ValueError("max-index must be zero or greater.")
     if args.list:
         return list_cameras(args.max_index, args.width, args.height, args.fps)
+    if not args.self_test and not acquire_single_instance():
+        hotkey = load_hotkey()
+        raise RuntimeError(
+            f"{WINDOW_TITLE}\u5df2\u7ecf\u5728\u8fd0\u884c\u3002"
+            f"\u6309 {hotkey.label} \u663e\u793a\u6216\u9690\u85cf\u7a97\u53e3\u3002"
+        )
 
     scan_all = args.all or not args.camera
     auto_select = not args.camera and not args.all and not args.self_test
