@@ -44,6 +44,8 @@ BACKENDS = (
     ("Media Foundation", cv2.CAP_MSMF),
 )
 MAX_ZOOM = 8.0
+MIN_PURE_PREVIEW_SCALE = 0.25
+MAX_PURE_PREVIEW_SCALE = 4.0
 DISPLAY_INTERVAL_MS = 50
 DEFAULT_CAPTURE_FOURCC = "MJPG"
 MULTI_CAMERA_WIDTH = 640
@@ -1254,6 +1256,13 @@ class CameraPanel:
             self._bind_drag_handle(widget)
         self.panel.bind("<ButtonPress-1>", self._activate_panel, add="+")
         self.canvas.bind("<ButtonPress-1>", self._activate_panel, add="+")
+        self.canvas.bind(
+            "<ButtonPress-1>", self._begin_borderless_window_drag, add="+"
+        )
+        self.canvas.bind("<B1-Motion>", self._drag_borderless_window, add="+")
+        self.canvas.bind(
+            "<ButtonRelease-1>", self._finish_borderless_window_drag, add="+"
+        )
         self.canvas.bind("<MouseWheel>", self.on_mouse_wheel)
 
     def set_chrome_visible(self, visible: bool) -> None:
@@ -1269,6 +1278,15 @@ class CameraPanel:
 
     def _activate_panel(self, _event=None) -> None:
         self.manager.activate_panel(self)
+
+    def _begin_borderless_window_drag(self, event) -> str | None:
+        return self.manager.begin_borderless_window_drag(event)
+
+    def _drag_borderless_window(self, event) -> str | None:
+        return self.manager.drag_borderless_window(event)
+
+    def _finish_borderless_window_drag(self, _event=None) -> str | None:
+        return self.manager.finish_borderless_window_drag()
 
     def _begin_drag(self, event) -> str:
         self.manager.activate_panel(self)
@@ -1411,6 +1429,8 @@ class CameraPanel:
             pass
 
     def on_mouse_wheel(self, event) -> str | None:
+        if self.manager.borderless:
+            return self.manager.resize_borderless_preview(event)
         if not self.image_bounds or not event.delta:
             return None
         left, top, width, height = self.image_bounds
@@ -1503,6 +1523,10 @@ class CameraManager:
         self._windowed_preview_placement = self.main_window_placement
         self._windowed_panel_placements = dict(self.panel_placements)
         self._windowed_workspace_offset = (0, 0)
+        self._borderless_content_offset = (0, 0)
+        self._borderless_preview_position: tuple[int, int] | None = None
+        self._borderless_window_drag_offset: tuple[int, int] | None = None
+        self._borderless_scale = 1.0
         self.always_on_top, self.borderless = load_preview_display_options()
         self.preview_window: tk.Toplevel | None = None
         self.preview_toolbar: ttk.Frame | None = None
@@ -1702,6 +1726,10 @@ class CameraManager:
         if self.preview_window is None or self.workspace is None:
             return
         try:
+            self._borderless_preview_position = None
+            self._borderless_window_drag_offset = None
+            self._borderless_content_offset = (0, 0)
+            self._borderless_scale = 1.0
             self.preview_window.update_idletasks()
             self._windowed_preview_placement = WindowPlacement(
                 x=self.preview_window.winfo_x(),
@@ -1773,9 +1801,9 @@ class CameraManager:
                 if placement is None:
                     placement = panel.current_placement()
                     self._windowed_panel_placements[panel.camera_index] = placement
-                width = max(1, placement.width)
+                width = max(1, round(placement.width * self._borderless_scale))
                 if panel.source_size is None:
-                    height = max(1, placement.height)
+                    height = max(1, round(placement.height * self._borderless_scale))
                 else:
                     source_width, source_height = panel.source_size
                     height = max(1, round(width * source_height / source_width))
@@ -1787,6 +1815,7 @@ class CameraManager:
             bottom = max(placement.y + height for _, placement, _, height in targets)
             window_width = max(1, right - left)
             window_height = max(1, bottom - top)
+            self._borderless_content_offset = (left, top)
 
             base = self._windowed_preview_placement
             if base is None:
@@ -1797,17 +1826,21 @@ class CameraManager:
                     height=self.preview_window.winfo_height(),
                 )
                 self._windowed_preview_placement = base
-            offset_x, offset_y = self._windowed_workspace_offset
-            window_x = base.x + offset_x + left
-            window_y = base.y + offset_y + top
-            window_x = min(
-                max(0, window_x),
-                max(0, self.preview_window.winfo_screenwidth() - window_width),
-            )
-            window_y = min(
-                max(0, window_y),
-                max(0, self.preview_window.winfo_screenheight() - window_height),
-            )
+            if self._borderless_preview_position is None:
+                offset_x, offset_y = self._windowed_workspace_offset
+                window_x = base.x + offset_x + left
+                window_y = base.y + offset_y + top
+                window_x = min(
+                    max(0, window_x),
+                    max(0, self.preview_window.winfo_screenwidth() - window_width),
+                )
+                window_y = min(
+                    max(0, window_y),
+                    max(0, self.preview_window.winfo_screenheight() - window_height),
+                )
+                self._borderless_preview_position = (window_x, window_y)
+            else:
+                window_x, window_y = self._borderless_preview_position
 
             for panel, placement, width, height in targets:
                 panel.panel.place_configure(
@@ -1817,11 +1850,127 @@ class CameraManager:
                     height=height,
                 )
             self.preview_window.geometry(
-                f"{window_width}x{window_height}+{window_x}+{window_y}"
+                f"{window_width}x{window_height}{window_x:+d}{window_y:+d}"
             )
             self.preview_window.update_idletasks()
         except tk.TclError:
             pass
+
+    def begin_borderless_window_drag(self, event) -> str | None:
+        if (
+            not self.borderless
+            or self.preview_window is None
+            or self.preview_fullscreen
+        ):
+            return None
+        try:
+            self.preview_window.update_idletasks()
+            self._borderless_window_drag_offset = (
+                event.x_root - self.preview_window.winfo_rootx(),
+                event.y_root - self.preview_window.winfo_rooty(),
+            )
+        except tk.TclError:
+            self._borderless_window_drag_offset = None
+        return "break"
+
+    def drag_borderless_window(self, event) -> str | None:
+        if self._borderless_window_drag_offset is None or self.preview_window is None:
+            return None
+        try:
+            offset_x, offset_y = self._borderless_window_drag_offset
+            window_x = round(event.x_root - offset_x)
+            window_y = round(event.y_root - offset_y)
+            self.preview_window.geometry(f"{window_x:+d}{window_y:+d}")
+            self._borderless_preview_position = (window_x, window_y)
+        except tk.TclError:
+            self._borderless_window_drag_offset = None
+        return "break"
+
+    def _remember_borderless_window_position(self) -> None:
+        if not self.borderless or self.preview_window is None:
+            return
+        try:
+            self.preview_window.update_idletasks()
+            window_x = self.preview_window.winfo_x()
+            window_y = self.preview_window.winfo_y()
+        except tk.TclError:
+            return
+
+        self._borderless_preview_position = (window_x, window_y)
+        base = self._windowed_preview_placement
+        if base is None:
+            return
+        offset_x, offset_y = self._windowed_workspace_offset
+        content_x, content_y = self._borderless_content_offset
+        placement = WindowPlacement(
+            x=window_x - offset_x - content_x,
+            y=window_y - offset_y - content_y,
+            width=base.width,
+            height=base.height,
+        )
+        self._windowed_preview_placement = placement
+        self.main_window_placement = placement
+        try:
+            save_main_window_placement(placement)
+        except OSError:
+            pass
+
+    def finish_borderless_window_drag(self) -> str | None:
+        if self._borderless_window_drag_offset is None:
+            return None
+        self._borderless_window_drag_offset = None
+        self._remember_borderless_window_position()
+        return "break"
+
+    def resize_borderless_preview(self, event) -> str | None:
+        if not event.delta or not self.borderless or self.preview_window is None:
+            return None
+        try:
+            self.preview_window.update_idletasks()
+            current_width = max(1, self.preview_window.winfo_width())
+            current_height = max(1, self.preview_window.winfo_height())
+            relative_x = min(
+                max(
+                    (event.x_root - self.preview_window.winfo_rootx()) / current_width,
+                    0.0,
+                ),
+                1.0,
+            )
+            relative_y = min(
+                max(
+                    (event.y_root - self.preview_window.winfo_rooty()) / current_height,
+                    0.0,
+                ),
+                1.0,
+            )
+        except tk.TclError:
+            return None
+
+        direction = 1 if event.delta > 0 else -1
+        new_scale = min(
+            max(self._borderless_scale * (1.15**direction), MIN_PURE_PREVIEW_SCALE),
+            MAX_PURE_PREVIEW_SCALE,
+        )
+        if new_scale == self._borderless_scale:
+            return "break"
+
+        scale_ratio = new_scale / self._borderless_scale
+        next_width = max(1, round(current_width * scale_ratio))
+        next_height = max(1, round(current_height * scale_ratio))
+        self._borderless_scale = new_scale
+        self._borderless_preview_position = (
+            round(event.x_root - relative_x * next_width),
+            round(event.y_root - relative_y * next_height),
+        )
+        if self._borderless_fit_after_id is not None:
+            try:
+                self.root.after_cancel(self._borderless_fit_after_id)
+            except tk.TclError:
+                pass
+            self._borderless_fit_after_id = None
+        self._fit_borderless_preview_to_panels()
+        self._remember_borderless_window_position()
+        return "break"
 
     def toggle_always_on_top(self) -> None:
         self.always_on_top = not self.always_on_top
@@ -1830,9 +1979,13 @@ class CameraManager:
 
     def toggle_borderless(self) -> None:
         if self.borderless:
+            self._remember_borderless_window_position()
             self.borderless = False
             self._apply_preview_display_options()
             self._restore_windowed_layout()
+            self._borderless_preview_position = None
+            self._borderless_window_drag_offset = None
+            self._borderless_scale = 1.0
         else:
             self._capture_windowed_layout()
             self.borderless = True
