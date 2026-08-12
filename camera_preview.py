@@ -44,8 +44,6 @@ BACKENDS = (
     ("Media Foundation", cv2.CAP_MSMF),
 )
 MAX_ZOOM = 8.0
-MIN_PURE_PREVIEW_SCALE = 0.25
-MAX_PURE_PREVIEW_SCALE = 4.0
 DISPLAY_INTERVAL_MS = 50
 DEFAULT_CAPTURE_FOURCC = "MJPG"
 MULTI_CAMERA_WIDTH = 640
@@ -60,6 +58,7 @@ DEFAULT_PANEL_HEIGHT = 420
 PANEL_PLACEMENTS_KEY = "panel_positions"
 MAIN_WINDOW_PLACEMENT_KEY = "main_window_position"
 PREVIEW_DISPLAY_OPTIONS_KEY = "preview_display_options"
+BORDERLESS_WINDOW_PLACEMENT_KEY = "borderless_window_position"
 WM_HOTKEY = 0x0312
 WM_QUIT = 0x0012
 HOTKEY_ID = 0xCA01
@@ -208,6 +207,9 @@ MIN_WINDOW_WIDTH = 480
 MIN_WINDOW_HEIGHT = 360
 MAX_WINDOW_DIMENSION = 10000
 MAX_WINDOW_COORDINATE = 100000
+PURE_RESIZE_BORDER = 10
+MIN_PURE_WINDOW_WIDTH = 160
+MIN_PURE_WINDOW_HEIGHT = 120
 NETWORK_DISCOVERY_TIMEOUT_SECONDS = 3.0
 NETWORK_REQUEST_TIMEOUT_SECONDS = 5.0
 NETWORK_STREAM_TIMEOUT_MILLISECONDS = 6000
@@ -249,7 +251,12 @@ class WindowPlacement:
     height: int
 
     @classmethod
-    def from_payload(cls, payload: object) -> "WindowPlacement | None":
+    def from_payload(
+        cls,
+        payload: object,
+        min_width: int = MIN_WINDOW_WIDTH,
+        min_height: int = MIN_WINDOW_HEIGHT,
+    ) -> "WindowPlacement | None":
         if not isinstance(payload, dict):
             return None
         try:
@@ -265,8 +272,8 @@ class WindowPlacement:
         if not (
             -MAX_WINDOW_COORDINATE <= placement.x <= MAX_WINDOW_COORDINATE
             and -MAX_WINDOW_COORDINATE <= placement.y <= MAX_WINDOW_COORDINATE
-            and MIN_WINDOW_WIDTH <= placement.width <= MAX_WINDOW_DIMENSION
-            and MIN_WINDOW_HEIGHT <= placement.height <= MAX_WINDOW_DIMENSION
+            and min_width <= placement.width <= MAX_WINDOW_DIMENSION
+            and min_height <= placement.height <= MAX_WINDOW_DIMENSION
         ):
             return None
         return placement
@@ -1063,6 +1070,28 @@ def save_main_window_placement(placement: WindowPlacement) -> None:
     save_settings_payload(payload)
 
 
+def load_borderless_window_placement() -> WindowPlacement | None:
+    placement = WindowPlacement.from_payload(
+        load_settings_payload().get(BORDERLESS_WINDOW_PLACEMENT_KEY),
+        min_width=MIN_PURE_WINDOW_WIDTH,
+        min_height=MIN_PURE_WINDOW_HEIGHT,
+    )
+    if placement is None:
+        return None
+    return WindowPlacement(
+        x=placement.x,
+        y=placement.y,
+        width=max(MIN_PURE_WINDOW_WIDTH, placement.width),
+        height=max(MIN_PURE_WINDOW_HEIGHT, placement.height),
+    )
+
+
+def save_borderless_window_placement(placement: WindowPlacement) -> None:
+    payload = load_settings_payload()
+    payload[BORDERLESS_WINDOW_PLACEMENT_KEY] = placement.to_payload()
+    save_settings_payload(payload)
+
+
 def load_preview_display_options() -> tuple[bool, bool]:
     payload = load_settings_payload()
     options = payload.get(PREVIEW_DISPLAY_OPTIONS_KEY)
@@ -1255,6 +1284,15 @@ class CameraPanel:
         for widget in (header, name_label, self.zoom_label, self.fps_label):
             self._bind_drag_handle(widget)
         self.panel.bind("<ButtonPress-1>", self._activate_panel, add="+")
+        self.panel.bind(
+            "<ButtonPress-1>", self._begin_borderless_window_drag, add="+"
+        )
+        self.panel.bind("<B1-Motion>", self._drag_borderless_window, add="+")
+        self.panel.bind(
+            "<ButtonRelease-1>", self._finish_borderless_window_drag, add="+"
+        )
+        self.panel.bind("<Motion>", self._update_borderless_window_cursor, add="+")
+        self.panel.bind("<Leave>", self._clear_borderless_window_cursor, add="+")
         self.canvas.bind("<ButtonPress-1>", self._activate_panel, add="+")
         self.canvas.bind(
             "<ButtonPress-1>", self._begin_borderless_window_drag, add="+"
@@ -1262,6 +1300,12 @@ class CameraPanel:
         self.canvas.bind("<B1-Motion>", self._drag_borderless_window, add="+")
         self.canvas.bind(
             "<ButtonRelease-1>", self._finish_borderless_window_drag, add="+"
+        )
+        self.canvas.bind(
+            "<Motion>", self._update_borderless_window_cursor, add="+"
+        )
+        self.canvas.bind(
+            "<Leave>", self._clear_borderless_window_cursor, add="+"
         )
         self.canvas.bind("<MouseWheel>", self.on_mouse_wheel)
 
@@ -1287,6 +1331,12 @@ class CameraPanel:
 
     def _finish_borderless_window_drag(self, _event=None) -> str | None:
         return self.manager.finish_borderless_window_drag()
+
+    def _update_borderless_window_cursor(self, event) -> None:
+        self.manager.update_borderless_window_cursor(event)
+
+    def _clear_borderless_window_cursor(self, _event=None) -> None:
+        self.manager.clear_borderless_window_cursor()
 
     def _begin_drag(self, event) -> str:
         self.manager.activate_panel(self)
@@ -1521,10 +1571,17 @@ class CameraManager:
         self._windowed_preview_placement = self.main_window_placement
         self._windowed_panel_placements = dict(self.panel_placements)
         self._windowed_workspace_offset = (0, 0)
+        self._saved_borderless_placement = load_borderless_window_placement()
+        self._borderless_custom_size: tuple[int, int] | None = None
         self._borderless_content_offset = (0, 0)
         self._borderless_preview_position: tuple[int, int] | None = None
         self._borderless_window_drag_offset: tuple[int, int] | None = None
-        self._borderless_scale = 1.0
+        self._borderless_resize_edges: str | None = None
+        self._borderless_resize_start: tuple[int, int, int, int, int, int] | None = None
+        self._borderless_resize_layout: list[
+            tuple[CameraPanel, int, int, int, int]
+        ] = []
+        self._borderless_manual_geometry = False
         self.always_on_top, self.borderless = load_preview_display_options()
         self.preview_window: tk.Toplevel | None = None
         self.preview_toolbar: ttk.Frame | None = None
@@ -1631,6 +1688,30 @@ class CameraManager:
 
         self.workspace = tk.Frame(window, background="#0f141b", highlightthickness=0)
         self.workspace.pack(fill=tk.BOTH, expand=True)
+        self.workspace.bind(
+            "<Motion>", self.update_borderless_window_cursor, add="+"
+        )
+        self.workspace.bind(
+            "<Leave>", self.clear_borderless_window_cursor, add="+"
+        )
+        self.workspace.bind(
+            "<ButtonPress-1>", self.begin_borderless_window_drag, add="+"
+        )
+        self.workspace.bind(
+            "<B1-Motion>", self.drag_borderless_window, add="+"
+        )
+        self.workspace.bind(
+            "<ButtonRelease-1>", self.finish_borderless_window_drag, add="+"
+        )
+        window.bind(
+            "<B1-Motion>", self.drag_borderless_window, add="+"
+        )
+        window.bind(
+            "<ButtonRelease-1>", self.finish_borderless_window_drag, add="+"
+        )
+        window.bind(
+            "<Motion>", self.update_borderless_window_cursor, add="+"
+        )
         window.bind("<Key-r>", lambda _event: self._reset_active_panel())
         window.bind("<Key-R>", lambda _event: self._reset_active_panel())
         window.bind("<Key-s>", lambda _event: self._save_active_panel())
@@ -1726,8 +1807,12 @@ class CameraManager:
         try:
             self._borderless_preview_position = None
             self._borderless_window_drag_offset = None
+            self._borderless_resize_edges = None
+            self._borderless_resize_start = None
+            self._borderless_resize_layout = []
+            self._borderless_manual_geometry = False
+            self._borderless_custom_size = None
             self._borderless_content_offset = (0, 0)
-            self._borderless_scale = 1.0
             self.preview_window.update_idletasks()
             self._windowed_preview_placement = WindowPlacement(
                 x=self.preview_window.winfo_x(),
@@ -1785,6 +1870,7 @@ class CameraManager:
         self._borderless_fit_after_id = None
         if (
             not self.borderless
+            or self._borderless_manual_geometry
             or self.preview_window is None
             or self.workspace is None
             or not self.windows
@@ -1799,9 +1885,9 @@ class CameraManager:
                 if placement is None:
                     placement = panel.current_placement()
                     self._windowed_panel_placements[panel.camera_index] = placement
-                width = max(1, round(placement.width * self._borderless_scale))
+                width = max(1, placement.width)
                 if panel.source_size is None:
-                    height = max(1, round(placement.height * self._borderless_scale))
+                    height = max(1, placement.height)
                 else:
                     source_width, source_height = panel.source_size
                     height = max(1, round(width * source_height / source_width))
@@ -1814,6 +1900,9 @@ class CameraManager:
             window_width = max(1, right - left)
             window_height = max(1, bottom - top)
             self._borderless_content_offset = (left, top)
+            layout_width = window_width
+            layout_height = window_height
+            saved = self._saved_borderless_placement
 
             base = self._windowed_preview_placement
             if base is None:
@@ -1825,9 +1914,25 @@ class CameraManager:
                 )
                 self._windowed_preview_placement = base
             if self._borderless_preview_position is None:
-                offset_x, offset_y = self._windowed_workspace_offset
-                window_x = base.x + offset_x + left
-                window_y = base.y + offset_y + top
+                if saved is not None:
+                    window_x = saved.x
+                    window_y = saved.y
+                    self._borderless_custom_size = (
+                        max(MIN_PURE_WINDOW_WIDTH, saved.width),
+                        max(MIN_PURE_WINDOW_HEIGHT, saved.height),
+                    )
+                else:
+                    offset_x, offset_y = self._windowed_workspace_offset
+                    window_x = base.x + offset_x + left
+                    window_y = base.y + offset_y + top
+                    window_x = min(
+                        max(0, window_x),
+                        max(0, self.preview_window.winfo_screenwidth() - window_width),
+                    )
+                    window_y = min(
+                        max(0, window_y),
+                        max(0, self.preview_window.winfo_screenheight() - window_height),
+                    )
                 window_x = min(
                     max(0, window_x),
                     max(0, self.preview_window.winfo_screenwidth() - window_width),
@@ -1840,12 +1945,36 @@ class CameraManager:
             else:
                 window_x, window_y = self._borderless_preview_position
 
+            if self._borderless_custom_size is not None:
+                window_width, window_height = self._borderless_custom_size
+                window_x = min(
+                    max(0, window_x),
+                    max(0, self.preview_window.winfo_screenwidth() - window_width),
+                )
+                window_y = min(
+                    max(0, window_y),
+                    max(0, self.preview_window.winfo_screenheight() - window_height),
+                )
+                self._borderless_preview_position = (window_x, window_y)
+
             for panel, placement, width, height in targets:
+                if self._borderless_custom_size is not None:
+                    scale_x = window_width / layout_width
+                    scale_y = window_height / layout_height
+                    panel_x = round((placement.x - left) * scale_x)
+                    panel_y = round((placement.y - top) * scale_y)
+                    panel_width = max(1, round(width * scale_x))
+                    panel_height = max(1, round(height * scale_y))
+                else:
+                    panel_x = placement.x - left
+                    panel_y = placement.y - top
+                    panel_width = width
+                    panel_height = height
                 panel.panel.place_configure(
-                    x=placement.x - left,
-                    y=placement.y - top,
-                    width=width,
-                    height=height,
+                    x=panel_x,
+                    y=panel_y,
+                    width=panel_width,
+                    height=panel_height,
                 )
             self.preview_window.geometry(
                 f"{window_width}x{window_height}{window_x:+d}{window_y:+d}"
@@ -1853,6 +1982,77 @@ class CameraManager:
             self.preview_window.update_idletasks()
         except tk.TclError:
             pass
+
+    def _borderless_resize_edges_at(self, event) -> str:
+        if (
+            not self.borderless
+            or self.preview_window is None
+            or self.preview_fullscreen
+        ):
+            return ""
+        try:
+            self.preview_window.update_idletasks()
+            width = max(1, self.preview_window.winfo_width())
+            height = max(1, self.preview_window.winfo_height())
+            x = event.x_root - self.preview_window.winfo_rootx()
+            y = event.y_root - self.preview_window.winfo_rooty()
+        except tk.TclError:
+            return ""
+
+        border = PURE_RESIZE_BORDER
+        edges = ""
+        if 0 <= x <= border:
+            edges += "w"
+        elif width - border <= x <= width:
+            edges += "e"
+        if 0 <= y <= border:
+            edges += "n"
+        elif height - border <= y <= height:
+            edges += "s"
+        return edges
+
+    @staticmethod
+    def _borderless_cursor_for_edges(edges: str) -> str:
+        if edges in ("n", "s"):
+            return "sb_v_double_arrow"
+        if edges in ("e", "w"):
+            return "sb_h_double_arrow"
+        if edges == "nw":
+            return "top_left_corner"
+        if edges == "se":
+            return "bottom_right_corner"
+        if edges == "ne":
+            return "top_right_corner"
+        if edges == "sw":
+            return "bottom_left_corner"
+        return ""
+
+    def update_borderless_window_cursor(self, event) -> None:
+        cursor = self._borderless_cursor_for_edges(
+            self._borderless_resize_edges_at(event)
+        )
+        try:
+            event.widget.configure(cursor=cursor)
+        except tk.TclError:
+            pass
+
+    def clear_borderless_window_cursor(self, event=None) -> None:
+        widget = getattr(event, "widget", None) or self.workspace
+        if widget is None:
+            return
+        try:
+            widget.configure(cursor="")
+        except tk.TclError:
+            pass
+
+    def _cancel_borderless_fit(self) -> None:
+        if self._borderless_fit_after_id is None:
+            return
+        try:
+            self.root.after_cancel(self._borderless_fit_after_id)
+        except tk.TclError:
+            pass
+        self._borderless_fit_after_id = None
 
     def begin_borderless_window_drag(self, event) -> str | None:
         if (
@@ -1863,6 +2063,37 @@ class CameraManager:
             return None
         try:
             self.preview_window.update_idletasks()
+            edges = self._borderless_resize_edges_at(event)
+            if edges:
+                window_x = self.preview_window.winfo_x()
+                window_y = self.preview_window.winfo_y()
+                window_width = max(1, self.preview_window.winfo_width())
+                window_height = max(1, self.preview_window.winfo_height())
+                self._borderless_resize_edges = edges
+                self._borderless_resize_start = (
+                    event.x_root,
+                    event.y_root,
+                    window_x,
+                    window_y,
+                    window_width,
+                    window_height,
+                )
+                self._borderless_resize_layout = []
+                for panel in self.windows.values():
+                    panel.panel.update_idletasks()
+                    self._borderless_resize_layout.append(
+                        (
+                            panel,
+                            panel.panel.winfo_x(),
+                            panel.panel.winfo_y(),
+                            panel.panel.winfo_width(),
+                            panel.panel.winfo_height(),
+                        )
+                    )
+                self._borderless_manual_geometry = True
+                self._borderless_custom_size = (window_width, window_height)
+                self._cancel_borderless_fit()
+                return "break"
             self._borderless_window_drag_offset = (
                 event.x_root - self.preview_window.winfo_rootx(),
                 event.y_root - self.preview_window.winfo_rooty(),
@@ -1872,6 +2103,8 @@ class CameraManager:
         return "break"
 
     def drag_borderless_window(self, event) -> str | None:
+        if self._borderless_resize_start is not None:
+            return self._resize_borderless_window(event)
         if self._borderless_window_drag_offset is None or self.preview_window is None:
             return None
         try:
@@ -1884,6 +2117,62 @@ class CameraManager:
             self._borderless_window_drag_offset = None
         return "break"
 
+    def _resize_borderless_window(self, event) -> str:
+        if self.preview_window is None or self._borderless_resize_start is None:
+            return "break"
+        start_x, start_y, start_window_x, start_window_y, start_width, start_height = (
+            self._borderless_resize_start
+        )
+        edges = self._borderless_resize_edges or ""
+        delta_x = event.x_root - start_x
+        delta_y = event.y_root - start_y
+        window_x = start_window_x
+        window_y = start_window_y
+        window_width = start_width
+        window_height = start_height
+        if "e" in edges:
+            window_width = start_width + delta_x
+        if "s" in edges:
+            window_height = start_height + delta_y
+        if "w" in edges:
+            window_x = start_window_x + delta_x
+            window_width = start_width - delta_x
+        if "n" in edges:
+            window_y = start_window_y + delta_y
+            window_height = start_height - delta_y
+
+        if window_width < MIN_PURE_WINDOW_WIDTH:
+            if "w" in edges:
+                window_x -= MIN_PURE_WINDOW_WIDTH - window_width
+            window_width = MIN_PURE_WINDOW_WIDTH
+        if window_height < MIN_PURE_WINDOW_HEIGHT:
+            if "n" in edges:
+                window_y -= MIN_PURE_WINDOW_HEIGHT - window_height
+            window_height = MIN_PURE_WINDOW_HEIGHT
+
+        window_width = min(window_width, MAX_WINDOW_DIMENSION)
+        window_height = min(window_height, MAX_WINDOW_DIMENSION)
+        try:
+            self.preview_window.geometry(
+                f"{round(window_width)}x{round(window_height)}"
+                f"{round(window_x):+d}{round(window_y):+d}"
+            )
+            self.preview_window.update_idletasks()
+            scale_x = window_width / max(1, start_width)
+            scale_y = window_height / max(1, start_height)
+            for panel, x, y, width, height in self._borderless_resize_layout:
+                panel.panel.place_configure(
+                    x=round(x * scale_x),
+                    y=round(y * scale_y),
+                    width=max(1, round(width * scale_x)),
+                    height=max(1, round(height * scale_y)),
+                )
+            self._borderless_preview_position = (round(window_x), round(window_y))
+            self._borderless_custom_size = (round(window_width), round(window_height))
+        except tk.TclError:
+            pass
+        return "break"
+
     def _remember_borderless_window_position(self) -> None:
         if not self.borderless or self.preview_window is None:
             return
@@ -1891,10 +2180,23 @@ class CameraManager:
             self.preview_window.update_idletasks()
             window_x = self.preview_window.winfo_x()
             window_y = self.preview_window.winfo_y()
+            window_width = max(1, self.preview_window.winfo_width())
+            window_height = max(1, self.preview_window.winfo_height())
         except tk.TclError:
             return
 
         self._borderless_preview_position = (window_x, window_y)
+        borderless_placement = WindowPlacement(
+            x=window_x,
+            y=window_y,
+            width=window_width,
+            height=window_height,
+        )
+        self._saved_borderless_placement = borderless_placement
+        try:
+            save_borderless_window_placement(borderless_placement)
+        except OSError:
+            pass
         base = self._windowed_preview_placement
         if base is None:
             return
@@ -1914,59 +2216,16 @@ class CameraManager:
             pass
 
     def finish_borderless_window_drag(self) -> str | None:
+        if self._borderless_resize_start is not None:
+            self._borderless_resize_start = None
+            self._borderless_resize_edges = None
+            self._borderless_resize_layout = []
+            self._borderless_manual_geometry = False
+            self._remember_borderless_window_position()
+            return "break"
         if self._borderless_window_drag_offset is None:
             return None
         self._borderless_window_drag_offset = None
-        self._remember_borderless_window_position()
-        return "break"
-
-    def resize_borderless_preview(self, event) -> str | None:
-        if not event.delta or not self.borderless or self.preview_window is None:
-            return None
-        try:
-            self.preview_window.update_idletasks()
-            current_width = max(1, self.preview_window.winfo_width())
-            current_height = max(1, self.preview_window.winfo_height())
-            relative_x = min(
-                max(
-                    (event.x_root - self.preview_window.winfo_rootx()) / current_width,
-                    0.0,
-                ),
-                1.0,
-            )
-            relative_y = min(
-                max(
-                    (event.y_root - self.preview_window.winfo_rooty()) / current_height,
-                    0.0,
-                ),
-                1.0,
-            )
-        except tk.TclError:
-            return None
-
-        direction = 1 if event.delta > 0 else -1
-        new_scale = min(
-            max(self._borderless_scale * (1.15**direction), MIN_PURE_PREVIEW_SCALE),
-            MAX_PURE_PREVIEW_SCALE,
-        )
-        if new_scale == self._borderless_scale:
-            return "break"
-
-        scale_ratio = new_scale / self._borderless_scale
-        next_width = max(1, round(current_width * scale_ratio))
-        next_height = max(1, round(current_height * scale_ratio))
-        self._borderless_scale = new_scale
-        self._borderless_preview_position = (
-            round(event.x_root - relative_x * next_width),
-            round(event.y_root - relative_y * next_height),
-        )
-        if self._borderless_fit_after_id is not None:
-            try:
-                self.root.after_cancel(self._borderless_fit_after_id)
-            except tk.TclError:
-                pass
-            self._borderless_fit_after_id = None
-        self._fit_borderless_preview_to_panels()
         self._remember_borderless_window_position()
         return "break"
 
@@ -1983,7 +2242,11 @@ class CameraManager:
             self._restore_windowed_layout()
             self._borderless_preview_position = None
             self._borderless_window_drag_offset = None
-            self._borderless_scale = 1.0
+            self._borderless_resize_edges = None
+            self._borderless_resize_start = None
+            self._borderless_resize_layout = []
+            self._borderless_manual_geometry = False
+            self._borderless_custom_size = None
         else:
             self._capture_windowed_layout()
             self.borderless = True
