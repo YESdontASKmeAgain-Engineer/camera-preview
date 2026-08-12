@@ -83,7 +83,15 @@ python -m pip install pyinstaller
 pyinstaller --noconfirm --clean CameraPreview.spec
 ```
 
-The generated executable is placed in `dist/CameraPreview.exe`.
+The portable build is placed in `dist/CameraPreview/`. Keep `CameraPreview.exe`
+and its `_internal` folder together when moving the application.
+
+## Portable Data
+
+The application never stores its own persistent data in `AppData`, `LocalAppData`,
+or `Roaming`. `camera_preview_settings.json` is created beside
+`CameraPreview.exe` and holds the hotkey, window location, panel layout, and display
+mode. Screenshots are saved to the `screenshots` folder beside the executable.
 
 ## License
 
