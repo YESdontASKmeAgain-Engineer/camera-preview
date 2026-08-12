@@ -1429,8 +1429,6 @@ class CameraPanel:
             pass
 
     def on_mouse_wheel(self, event) -> str | None:
-        if self.manager.borderless:
-            return self.manager.resize_borderless_preview(event)
         if not self.image_bounds or not event.delta:
             return None
         left, top, width, height = self.image_bounds
