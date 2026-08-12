@@ -911,9 +911,15 @@ def list_cameras(max_index: int, width: int, height: int, fps: int) -> int:
 
 
 def application_directory() -> Path:
+    """Return the folder carried with the application, never an AppData folder."""
     if getattr(sys, "frozen", False):
         return Path(sys.executable).resolve().parent
     return Path(__file__).resolve().parent
+
+
+def portable_data_directory() -> Path:
+    """Keep all persistent application data beside the portable executable."""
+    return application_directory()
 
 
 def acquire_single_instance() -> bool:
@@ -942,7 +948,7 @@ def acquire_single_instance() -> bool:
 
 
 def hotkey_settings_path() -> Path:
-    return application_directory() / HOTKEY_SETTINGS_FILENAME
+    return portable_data_directory() / HOTKEY_SETTINGS_FILENAME
 
 
 def load_settings_payload() -> dict[str, object]:
@@ -1116,7 +1122,7 @@ def save_preview_display_options(always_on_top: bool, borderless: bool) -> None:
 
 
 def save_frame(frame, camera_index: int | str) -> Path:
-    screenshot_dir = application_directory() / "screenshots"
+    screenshot_dir = portable_data_directory() / "screenshots"
     screenshot_dir.mkdir(exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     safe_camera_index = re.sub(r"[^A-Za-z0-9_-]+", "_", str(camera_index)).strip("_")
