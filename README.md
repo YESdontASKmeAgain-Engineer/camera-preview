@@ -65,8 +65,8 @@ python camera_preview.py --camera 0 --camera 1
 | `S` | Save a screenshot |
 | `F` or `F11` | Toggle full screen |
 | `Esc` or `Q` | Close the application |
-| `Ctrl` + `D` | Switch to the next available local camera |
-| `Ctrl` + `A` | Switch to the previous available local camera |
+| `Ctrl` + `N` | Switch to the next available local camera |
+| `Ctrl` + `P` | Switch to the previous available local camera |
 | `Ctrl` + `E` | Globally hide or restore all preview windows |
 | `\u5feb\u6377\u952e` button | Set a different `Ctrl` + key global hide/show hotkey |
 | `\u53d6\u6d88\u7f6e\u9876` / `\u7f6e\u9876` | Keep the preview above other applications or disable it |

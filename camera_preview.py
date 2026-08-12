@@ -44,6 +44,8 @@ BACKENDS = (
     ("Media Foundation", cv2.CAP_MSMF),
 )
 MAX_ZOOM = 8.0
+MIN_PURE_PREVIEW_SCALE = 0.25
+MAX_PURE_PREVIEW_SCALE = 4.0
 DISPLAY_INTERVAL_MS = 50
 DEFAULT_CAPTURE_FOURCC = "MJPG"
 MULTI_CAMERA_WIDTH = 640
@@ -71,6 +73,9 @@ HOTKEY_SETTINGS_FILENAME = "camera_preview_settings.json"
 TK_SHIFT_MASK = 0x0001
 TK_CONTROL_MASK = 0x0004
 TK_ALT_MASK = 0x0008
+ERROR_ALREADY_EXISTS = 183
+SINGLE_INSTANCE_MUTEX_NAME = r"Local\CameraPreview-7F0D4E7E-9A77-4D08-9807-9B0F8B8E33E1"
+_single_instance_mutex = None
 
 SPECIAL_KEY_LABELS = {
     0x08: "Backspace",
@@ -841,9 +846,15 @@ def select_local_captures(
     dialog.bind("<Escape>", lambda _event: cancel())
     dialog.protocol("WM_DELETE_WINDOW", cancel)
     dialog.grab_set()
+    dialog.deiconify()
+    dialog.lift()
+    dialog.focus_force()
 
     def center_dialog() -> None:
         try:
+            dialog.deiconify()
+            dialog.lift()
+            dialog.focus_force()
             dialog.update_idletasks()
             left = max(0, (dialog.winfo_screenwidth() - dialog.winfo_width()) // 2)
             top = max(0, (dialog.winfo_screenheight() - dialog.winfo_height()) // 2)
@@ -896,6 +907,31 @@ def application_directory() -> Path:
     if getattr(sys, "frozen", False):
         return Path(sys.executable).resolve().parent
     return Path(__file__).resolve().parent
+
+
+def acquire_single_instance() -> bool:
+    """Keep another GUI instance from silently taking over the cameras."""
+    global _single_instance_mutex
+    if sys.platform != "win32":
+        return True
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    create_mutex = kernel32.CreateMutexW
+    create_mutex.argtypes = (wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR)
+    create_mutex.restype = wintypes.HANDLE
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = (wintypes.HANDLE,)
+    close_handle.restype = wintypes.BOOL
+
+    mutex = create_mutex(None, False, SINGLE_INSTANCE_MUTEX_NAME)
+    if not mutex:
+        return True
+    if ctypes.get_last_error() == ERROR_ALREADY_EXISTS:
+        close_handle(mutex)
+        return False
+
+    _single_instance_mutex = mutex
+    return True
 
 
 def hotkey_settings_path() -> Path:
@@ -1093,6 +1129,7 @@ class CameraPanel:
         self.status_until = 0.0
         self.image_photo = None
         self.image_bounds: tuple[int, int, int, int] | None = None
+        self.source_size: tuple[int, int] | None = None
         self._drag_offset: tuple[int, int] | None = None
         self._draw_after_id: str | None = None
         self.chrome_visible = True
@@ -1219,6 +1256,13 @@ class CameraPanel:
             self._bind_drag_handle(widget)
         self.panel.bind("<ButtonPress-1>", self._activate_panel, add="+")
         self.canvas.bind("<ButtonPress-1>", self._activate_panel, add="+")
+        self.canvas.bind(
+            "<ButtonPress-1>", self._begin_borderless_window_drag, add="+"
+        )
+        self.canvas.bind("<B1-Motion>", self._drag_borderless_window, add="+")
+        self.canvas.bind(
+            "<ButtonRelease-1>", self._finish_borderless_window_drag, add="+"
+        )
         self.canvas.bind("<MouseWheel>", self.on_mouse_wheel)
 
     def set_chrome_visible(self, visible: bool) -> None:
@@ -1234,6 +1278,15 @@ class CameraPanel:
 
     def _activate_panel(self, _event=None) -> None:
         self.manager.activate_panel(self)
+
+    def _begin_borderless_window_drag(self, event) -> str | None:
+        return self.manager.begin_borderless_window_drag(event)
+
+    def _drag_borderless_window(self, event) -> str | None:
+        return self.manager.drag_borderless_window(event)
+
+    def _finish_borderless_window_drag(self, _event=None) -> str | None:
+        return self.manager.finish_borderless_window_drag()
 
     def _begin_drag(self, event) -> str:
         self.manager.activate_panel(self)
@@ -1352,6 +1405,10 @@ class CameraPanel:
         frame = self._take_latest_frame()
         if frame is not None:
             source_height, source_width = frame.shape[:2]
+            source_size = (source_width, source_height)
+            if source_size != self.source_size:
+                self.source_size = source_size
+                self.manager._schedule_borderless_fit()
             left, top, display_width, display_height = self._display_size(source_width, source_height)
             display_frame = self.zoom_view.render(frame, display_width, display_height)
             self._update_photo(display_frame)
@@ -1372,6 +1429,8 @@ class CameraPanel:
             pass
 
     def on_mouse_wheel(self, event) -> str | None:
+        if self.manager.borderless:
+            return self.manager.resize_borderless_preview(event)
         if not self.image_bounds or not event.delta:
             return None
         left, top, width, height = self.image_bounds
@@ -1461,6 +1520,13 @@ class CameraManager:
         self.windows: dict[int | str, CameraPanel] = {}
         self.panel_placements = load_panel_placements()
         self.main_window_placement = load_main_window_placement()
+        self._windowed_preview_placement = self.main_window_placement
+        self._windowed_panel_placements = dict(self.panel_placements)
+        self._windowed_workspace_offset = (0, 0)
+        self._borderless_content_offset = (0, 0)
+        self._borderless_preview_position: tuple[int, int] | None = None
+        self._borderless_window_drag_offset: tuple[int, int] | None = None
+        self._borderless_scale = 1.0
         self.always_on_top, self.borderless = load_preview_display_options()
         self.preview_window: tk.Toplevel | None = None
         self.preview_toolbar: ttk.Frame | None = None
@@ -1471,6 +1537,12 @@ class CameraManager:
         self.borderless_button: ttk.Button | None = None
         self._show_launcher_when_empty = not captures
         self.launcher_window: tk.Toplevel | None = None
+        self.launcher_scan_button: ttk.Button | None = None
+        self.launcher_status_var: tk.StringVar | None = None
+        self._local_scan_events = queue.SimpleQueue()
+        self._local_scan_poll_after_id: str | None = None
+        self._local_scan_running = False
+        self._borderless_fit_after_id: str | None = None
         self._network_dialog_cleanups: set = set()
         self.shutting_down = False
         self._hotkey_poll_after_id: str | None = None
@@ -1576,14 +1648,16 @@ class CameraManager:
         window.bind("<Control-t>", lambda _event: self.toggle_always_on_top())
         window.bind("<Control-T>", lambda _event: self.toggle_always_on_top())
         window.bind(
-            "<Control-KeyPress-d>",
+            "<Control-KeyPress-n>",
             lambda _event: self._handle_camera_switch(1),
         )
         window.bind(
-            "<Control-KeyPress-a>",
+            "<Control-KeyPress-p>",
             lambda _event: self._handle_camera_switch(-1),
         )
         window.bind("<Button-3>", self.show_preview_menu, add="+")
+        if self.borderless:
+            self._capture_windowed_layout()
         self._apply_preview_display_options()
 
     def _show_preview_window(self) -> None:
@@ -1631,6 +1705,10 @@ class CameraManager:
         try:
             self.preview_window.attributes("-topmost", self.always_on_top)
             self.preview_window.overrideredirect(self.borderless)
+            self.preview_window.minsize(
+                1 if self.borderless else 720,
+                1 if self.borderless else 480,
+            )
             if self.preview_toolbar is not None:
                 if self.borderless:
                     self.preview_toolbar.pack_forget()
@@ -1644,14 +1722,275 @@ class CameraManager:
         except tk.TclError:
             pass
 
+    def _capture_windowed_layout(self) -> None:
+        if self.preview_window is None or self.workspace is None:
+            return
+        try:
+            self._borderless_preview_position = None
+            self._borderless_window_drag_offset = None
+            self._borderless_content_offset = (0, 0)
+            self._borderless_scale = 1.0
+            self.preview_window.update_idletasks()
+            self._windowed_preview_placement = WindowPlacement(
+                x=self.preview_window.winfo_x(),
+                y=self.preview_window.winfo_y(),
+                width=self.preview_window.winfo_width(),
+                height=self.preview_window.winfo_height(),
+            )
+            self._windowed_workspace_offset = (
+                self.workspace.winfo_rootx() - self.preview_window.winfo_rootx(),
+                self.workspace.winfo_rooty() - self.preview_window.winfo_rooty(),
+            )
+            for panel in self.windows.values():
+                self._windowed_panel_placements[panel.camera_index] = (
+                    panel.current_placement()
+                )
+        except tk.TclError:
+            pass
+
+    def _restore_windowed_layout(self) -> None:
+        if self.preview_window is None:
+            return
+        try:
+            if self._windowed_preview_placement is not None:
+                self.preview_window.geometry(
+                    self._geometry_from_placement(self._windowed_preview_placement)
+                )
+            for panel in self.windows.values():
+                placement = self._windowed_panel_placements.get(panel.camera_index)
+                if placement is not None:
+                    panel.panel.place_configure(
+                        x=placement.x,
+                        y=placement.y,
+                        width=placement.width,
+                        height=placement.height,
+                    )
+            self.preview_window.update_idletasks()
+        except tk.TclError:
+            pass
+
+    def _schedule_borderless_fit(self) -> None:
+        if (
+            not self.borderless
+            or not self.windows
+            or self._borderless_fit_after_id is not None
+        ):
+            return
+        try:
+            self._borderless_fit_after_id = self.root.after_idle(
+                self._fit_borderless_preview_to_panels
+            )
+        except tk.TclError:
+            pass
+
+    def _fit_borderless_preview_to_panels(self) -> None:
+        self._borderless_fit_after_id = None
+        if (
+            not self.borderless
+            or self.preview_window is None
+            or self.workspace is None
+            or not self.windows
+        ):
+            return
+
+        try:
+            self.preview_window.update_idletasks()
+            targets: list[tuple[CameraPanel, WindowPlacement, int, int]] = []
+            for panel in self.windows.values():
+                placement = self._windowed_panel_placements.get(panel.camera_index)
+                if placement is None:
+                    placement = panel.current_placement()
+                    self._windowed_panel_placements[panel.camera_index] = placement
+                width = max(1, round(placement.width * self._borderless_scale))
+                if panel.source_size is None:
+                    height = max(1, round(placement.height * self._borderless_scale))
+                else:
+                    source_width, source_height = panel.source_size
+                    height = max(1, round(width * source_height / source_width))
+                targets.append((panel, placement, width, height))
+
+            left = min(placement.x for _, placement, _, _ in targets)
+            top = min(placement.y for _, placement, _, _ in targets)
+            right = max(placement.x + width for _, placement, width, _ in targets)
+            bottom = max(placement.y + height for _, placement, _, height in targets)
+            window_width = max(1, right - left)
+            window_height = max(1, bottom - top)
+            self._borderless_content_offset = (left, top)
+
+            base = self._windowed_preview_placement
+            if base is None:
+                base = WindowPlacement(
+                    x=self.preview_window.winfo_x(),
+                    y=self.preview_window.winfo_y(),
+                    width=self.preview_window.winfo_width(),
+                    height=self.preview_window.winfo_height(),
+                )
+                self._windowed_preview_placement = base
+            if self._borderless_preview_position is None:
+                offset_x, offset_y = self._windowed_workspace_offset
+                window_x = base.x + offset_x + left
+                window_y = base.y + offset_y + top
+                window_x = min(
+                    max(0, window_x),
+                    max(0, self.preview_window.winfo_screenwidth() - window_width),
+                )
+                window_y = min(
+                    max(0, window_y),
+                    max(0, self.preview_window.winfo_screenheight() - window_height),
+                )
+                self._borderless_preview_position = (window_x, window_y)
+            else:
+                window_x, window_y = self._borderless_preview_position
+
+            for panel, placement, width, height in targets:
+                panel.panel.place_configure(
+                    x=placement.x - left,
+                    y=placement.y - top,
+                    width=width,
+                    height=height,
+                )
+            self.preview_window.geometry(
+                f"{window_width}x{window_height}{window_x:+d}{window_y:+d}"
+            )
+            self.preview_window.update_idletasks()
+        except tk.TclError:
+            pass
+
+    def begin_borderless_window_drag(self, event) -> str | None:
+        if (
+            not self.borderless
+            or self.preview_window is None
+            or self.preview_fullscreen
+        ):
+            return None
+        try:
+            self.preview_window.update_idletasks()
+            self._borderless_window_drag_offset = (
+                event.x_root - self.preview_window.winfo_rootx(),
+                event.y_root - self.preview_window.winfo_rooty(),
+            )
+        except tk.TclError:
+            self._borderless_window_drag_offset = None
+        return "break"
+
+    def drag_borderless_window(self, event) -> str | None:
+        if self._borderless_window_drag_offset is None or self.preview_window is None:
+            return None
+        try:
+            offset_x, offset_y = self._borderless_window_drag_offset
+            window_x = round(event.x_root - offset_x)
+            window_y = round(event.y_root - offset_y)
+            self.preview_window.geometry(f"{window_x:+d}{window_y:+d}")
+            self._borderless_preview_position = (window_x, window_y)
+        except tk.TclError:
+            self._borderless_window_drag_offset = None
+        return "break"
+
+    def _remember_borderless_window_position(self) -> None:
+        if not self.borderless or self.preview_window is None:
+            return
+        try:
+            self.preview_window.update_idletasks()
+            window_x = self.preview_window.winfo_x()
+            window_y = self.preview_window.winfo_y()
+        except tk.TclError:
+            return
+
+        self._borderless_preview_position = (window_x, window_y)
+        base = self._windowed_preview_placement
+        if base is None:
+            return
+        offset_x, offset_y = self._windowed_workspace_offset
+        content_x, content_y = self._borderless_content_offset
+        placement = WindowPlacement(
+            x=window_x - offset_x - content_x,
+            y=window_y - offset_y - content_y,
+            width=base.width,
+            height=base.height,
+        )
+        self._windowed_preview_placement = placement
+        self.main_window_placement = placement
+        try:
+            save_main_window_placement(placement)
+        except OSError:
+            pass
+
+    def finish_borderless_window_drag(self) -> str | None:
+        if self._borderless_window_drag_offset is None:
+            return None
+        self._borderless_window_drag_offset = None
+        self._remember_borderless_window_position()
+        return "break"
+
+    def resize_borderless_preview(self, event) -> str | None:
+        if not event.delta or not self.borderless or self.preview_window is None:
+            return None
+        try:
+            self.preview_window.update_idletasks()
+            current_width = max(1, self.preview_window.winfo_width())
+            current_height = max(1, self.preview_window.winfo_height())
+            relative_x = min(
+                max(
+                    (event.x_root - self.preview_window.winfo_rootx()) / current_width,
+                    0.0,
+                ),
+                1.0,
+            )
+            relative_y = min(
+                max(
+                    (event.y_root - self.preview_window.winfo_rooty()) / current_height,
+                    0.0,
+                ),
+                1.0,
+            )
+        except tk.TclError:
+            return None
+
+        direction = 1 if event.delta > 0 else -1
+        new_scale = min(
+            max(self._borderless_scale * (1.15**direction), MIN_PURE_PREVIEW_SCALE),
+            MAX_PURE_PREVIEW_SCALE,
+        )
+        if new_scale == self._borderless_scale:
+            return "break"
+
+        scale_ratio = new_scale / self._borderless_scale
+        next_width = max(1, round(current_width * scale_ratio))
+        next_height = max(1, round(current_height * scale_ratio))
+        self._borderless_scale = new_scale
+        self._borderless_preview_position = (
+            round(event.x_root - relative_x * next_width),
+            round(event.y_root - relative_y * next_height),
+        )
+        if self._borderless_fit_after_id is not None:
+            try:
+                self.root.after_cancel(self._borderless_fit_after_id)
+            except tk.TclError:
+                pass
+            self._borderless_fit_after_id = None
+        self._fit_borderless_preview_to_panels()
+        self._remember_borderless_window_position()
+        return "break"
+
     def toggle_always_on_top(self) -> None:
         self.always_on_top = not self.always_on_top
         self._apply_preview_display_options()
         self._save_preview_display_options()
 
     def toggle_borderless(self) -> None:
-        self.borderless = not self.borderless
-        self._apply_preview_display_options()
+        if self.borderless:
+            self._remember_borderless_window_position()
+            self.borderless = False
+            self._apply_preview_display_options()
+            self._restore_windowed_layout()
+            self._borderless_preview_position = None
+            self._borderless_window_drag_offset = None
+            self._borderless_scale = 1.0
+        else:
+            self._capture_windowed_layout()
+            self.borderless = True
+            self._apply_preview_display_options()
+            self._schedule_borderless_fit()
         self._save_preview_display_options()
 
     def show_preview_menu(self, event) -> str:
@@ -1819,10 +2158,13 @@ class CameraManager:
             self.panel_placements.get(opened.index),
         )
         self.windows[opened.index] = panel
+        if opened.index not in self._windowed_panel_placements:
+            self._windowed_panel_placements[opened.index] = panel.current_placement()
         self.activate_panel(panel)
         self._apply_capture_performance_profile()
         self.hide_launcher()
         self._show_preview_window()
+        self._schedule_borderless_fit()
         return True
 
     def _apply_capture_performance_profile(self) -> None:
@@ -1855,6 +2197,13 @@ class CameraManager:
         except tk.TclError:
             return
 
+        if self.borderless:
+            placement = self._windowed_panel_placements.get(
+                panel.camera_index, placement
+            )
+        else:
+            self._windowed_panel_placements[panel.camera_index] = placement
+
         self.panel_placements[panel.camera_index] = placement
         try:
             save_panel_placement(panel.camera_index, placement)
@@ -1862,7 +2211,7 @@ class CameraManager:
             pass
 
     def remember_main_window_placement(self) -> None:
-        if self.preview_window is None:
+        if self.preview_window is None or self.borderless:
             return
         try:
             self.preview_window.update_idletasks()
@@ -1906,11 +2255,12 @@ class CameraManager:
         ttk.Label(container, text=WINDOW_TITLE, font=("Segoe UI", 14)).pack(
             anchor=tk.W, pady=(0, 14)
         )
-        ttk.Button(
+        self.launcher_scan_button = ttk.Button(
             container,
             text="\u626b\u63cf USB \u6444\u50cf\u5934",
             command=self.scan_for_cameras,
-        ).pack(fill=tk.X)
+        )
+        self.launcher_scan_button.pack(fill=tk.X)
         ttk.Button(
             container,
             text="\u67e5\u627e\u7f51\u7edc\u6444\u50cf\u5934",
@@ -1919,7 +2269,19 @@ class CameraManager:
         ttk.Button(container, text="\u9000\u51fa", command=self.close_all).pack(
             fill=tk.X, pady=(8, 0)
         )
-        launcher.geometry("360x190")
+        self.launcher_status_var = tk.StringVar(
+            value="\u70b9\u51fb\u201c\u626b\u63cf USB \u6444\u50cf\u5934\u201d\u5f00\u59cb\u3002"
+        )
+        ttk.Label(
+            container,
+            textvariable=self.launcher_status_var,
+            justify=tk.LEFT,
+            wraplength=324,
+        ).pack(fill=tk.X, pady=(12, 0))
+        launcher.geometry("360x230")
+        launcher.deiconify()
+        launcher.lift()
+        launcher.focus_force()
         launcher.after_idle(lambda: self._center_window(launcher, self.root))
 
     def hide_launcher(self) -> None:
@@ -1930,6 +2292,16 @@ class CameraManager:
                 self.launcher_window.withdraw()
         except tk.TclError:
             self.launcher_window = None
+
+    def _set_launcher_status(self, message: str) -> None:
+        if self.launcher_status_var is not None:
+            self.launcher_status_var.set(message)
+        if self.launcher_window is not None:
+            try:
+                if self.launcher_window.winfo_exists():
+                    self.launcher_window.update_idletasks()
+            except tk.TclError:
+                self.launcher_window = None
 
     @staticmethod
     def _center_window(dialog, parent) -> None:
@@ -2385,43 +2757,122 @@ class CameraManager:
         dialog.after_idle(lambda: self._center_window(dialog, parent))
 
     def scan_for_cameras(self) -> None:
-        if self.shutting_down:
+        if self.shutting_down or self._local_scan_running:
             return
         known_indices = set(self.windows)
         local_camera_count = sum(
             isinstance(camera_index, int) for camera_index in known_indices
         )
-        added = 0
-        for index in range(self.max_index + 1):
-            if index in known_indices:
-                continue
-            use_multi_profile = local_camera_count >= 1
-            width = min(self.width, MULTI_CAMERA_WIDTH) if use_multi_profile else self.width
-            height = (
-                min(self.height, MULTI_CAMERA_HEIGHT) if use_multi_profile else self.height
-            )
-            fps = min(self.fps, MULTI_CAMERA_FPS) if use_multi_profile else self.fps
-            fourcc = MULTI_CAMERA_FOURCC if use_multi_profile else self.capture_fourcc
-            try:
-                opened = open_capture(index, width, height, fps, fourcc)
-            except RuntimeError:
-                continue
-            if self.add_camera(opened):
-                local_camera_count += 1
-                if local_camera_count > 1:
-                    self._switch_local_captures_to_multi_profile()
-                added += 1
+        self._local_scan_running = True
+        if self.launcher_scan_button is not None:
+            self.launcher_scan_button.configure(state=tk.DISABLED)
+        self._set_launcher_status(
+            "\u6b63\u5728\u626b\u63cf USB \u6444\u50cf\u5934\uff0c\u8bf7\u7a0d\u5019\u2026"
+        )
 
-        message = "No new cameras found." if not added else f"Added {added} camera(s)."
+        def worker() -> None:
+            opened_captures: list[OpenedCapture] = []
+            scan_local_camera_count = local_camera_count
+            try:
+                for index in range(self.max_index + 1):
+                    if index in known_indices:
+                        continue
+                    use_multi_profile = scan_local_camera_count >= 1
+                    width = (
+                        min(self.width, MULTI_CAMERA_WIDTH)
+                        if use_multi_profile
+                        else self.width
+                    )
+                    height = (
+                        min(self.height, MULTI_CAMERA_HEIGHT)
+                        if use_multi_profile
+                        else self.height
+                    )
+                    fps = (
+                        min(self.fps, MULTI_CAMERA_FPS)
+                        if use_multi_profile
+                        else self.fps
+                    )
+                    fourcc = (
+                        MULTI_CAMERA_FOURCC
+                        if use_multi_profile
+                        else self.capture_fourcc
+                    )
+                    try:
+                        opened = open_capture(index, width, height, fps, fourcc)
+                    except RuntimeError:
+                        continue
+                    opened_captures.append(opened)
+                    scan_local_camera_count += 1
+            except Exception as error:
+                for opened in opened_captures:
+                    opened.capture.release()
+                self._local_scan_events.put(([], str(error)))
+            else:
+                self._local_scan_events.put((opened_captures, None))
+
+        threading.Thread(
+            target=worker,
+            name="camera-preview-local-scan",
+            daemon=True,
+        ).start()
+        self._local_scan_poll_after_id = self.root.after(80, self._poll_local_scan_events)
+
+    def _poll_local_scan_events(self) -> None:
+        self._local_scan_poll_after_id = None
+        try:
+            opened_captures, error = self._local_scan_events.get_nowait()
+        except queue.Empty:
+            if self._local_scan_running and not self.shutting_down:
+                self._local_scan_poll_after_id = self.root.after(
+                    80, self._poll_local_scan_events
+                )
+            return
+
+        added = 0
+        local_camera_count = sum(
+            isinstance(camera_index, int) for camera_index in self.windows
+        )
+        for opened in opened_captures:
+            if self.shutting_down:
+                opened.capture.release()
+                continue
+            if not self.add_camera(opened):
+                continue
+            local_camera_count += 1
+            if local_camera_count > 1:
+                self._switch_local_captures_to_multi_profile()
+            added += 1
+
+        self._local_scan_running = False
+        if self.launcher_scan_button is not None:
+            try:
+                self.launcher_scan_button.configure(state=tk.NORMAL)
+            except tk.TclError:
+                self.launcher_scan_button = None
+
+        if error:
+            message = f"\u626b\u63cf\u5931\u8d25\uff1a{error}"
+        elif added:
+            message = f"\u5df2\u627e\u5230\u5e76\u6253\u5f00 {added} \u53f0 USB \u6444\u50cf\u5934\u3002"
+        else:
+            message = (
+                "\u672a\u627e\u5230\u53ef\u7528\u7684 USB \u6444\u50cf\u5934\u3002"
+                "\u8bf7\u68c0\u67e5\u8fde\u63a5\uff0c\u5e76\u5173\u95ed\u5360\u7528\u6444\u50cf\u5934\u7684\u5176\u4ed6\u7a0b\u5e8f\u3002"
+            )
+        self._set_launcher_status(message)
         for window in self.windows.values():
             window.set_status(message)
 
     def camera_closed(self, panel: CameraPanel) -> None:
         if self.windows.get(panel.camera_index) is panel:
             del self.windows[panel.camera_index]
+        self._windowed_panel_placements.pop(panel.camera_index, None)
         if self.active_panel is panel:
             self.active_panel = next(iter(self.windows.values()), None)
         self._apply_capture_performance_profile()
+        if self.windows and self.borderless:
+            self._schedule_borderless_fit()
         if not self.windows and not self.shutting_down:
             self._hide_preview_window()
             if self._show_launcher_when_empty:
@@ -2434,7 +2885,12 @@ class CameraManager:
             return
         self.shutting_down = True
         self.remember_main_window_placement()
-        for callback_id in (self._hotkey_poll_after_id, self._close_after_id):
+        for callback_id in (
+            self._hotkey_poll_after_id,
+            self._close_after_id,
+            self._local_scan_poll_after_id,
+            self._borderless_fit_after_id,
+        ):
             if callback_id is None:
                 continue
             try:
@@ -2443,6 +2899,9 @@ class CameraManager:
                 pass
         self._hotkey_poll_after_id = None
         self._close_after_id = None
+        self._local_scan_poll_after_id = None
+        self._local_scan_running = False
+        self._borderless_fit_after_id = None
         self._stop_hotkey_listener()
         for cleanup_dialog in tuple(self._network_dialog_cleanups):
             cleanup_dialog()
@@ -2525,6 +2984,12 @@ def main() -> int:
         raise ValueError("max-index must be zero or greater.")
     if args.list:
         return list_cameras(args.max_index, args.width, args.height, args.fps)
+    if not args.self_test and not acquire_single_instance():
+        hotkey = load_hotkey()
+        raise RuntimeError(
+            f"{WINDOW_TITLE}\u5df2\u7ecf\u5728\u8fd0\u884c\u3002"
+            f"\u6309 {hotkey.label} \u663e\u793a\u6216\u9690\u85cf\u7a97\u53e3\u3002"
+        )
 
     scan_all = args.all or not args.camera
     auto_select = not args.camera and not args.all and not args.self_test
