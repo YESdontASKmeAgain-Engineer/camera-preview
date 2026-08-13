@@ -7,6 +7,7 @@ import base64
 import ctypes
 import hashlib
 import html
+import hmac
 import ipaddress
 import json
 import os
@@ -69,6 +70,9 @@ LAN_STREAM_DEFAULT_QUALITY = 80
 LAN_STREAM_MIN_QUALITY = 20
 LAN_STREAM_MAX_QUALITY = 100
 LAN_STREAM_FPS = 30.0
+LAN_STREAM_AUTH_USERNAME = "camera"
+LAN_STREAM_PASSWORD_ITERATIONS = 200_000
+LAN_STREAM_PASSWORD_SALT_BYTES = 16
 WM_HOTKEY = 0x0312
 WM_QUIT = 0x0012
 HOTKEY_ID = 0xCA01
@@ -1199,11 +1203,49 @@ def save_preview_display_options(always_on_top: bool, borderless: bool) -> None:
     save_settings_payload(payload)
 
 
-def load_lan_stream_options() -> tuple[int, int]:
+def _lan_stream_password_record(password: str) -> dict[str, str | int]:
+    salt = os.urandom(LAN_STREAM_PASSWORD_SALT_BYTES)
+    password_hash = hashlib.pbkdf2_hmac(
+        "sha256",
+        password.encode("utf-8"),
+        salt,
+        LAN_STREAM_PASSWORD_ITERATIONS,
+    )
+    return {
+        "algorithm": "pbkdf2_sha256",
+        "iterations": LAN_STREAM_PASSWORD_ITERATIONS,
+        "salt": base64.b64encode(salt).decode("ascii"),
+        "hash": base64.b64encode(password_hash).decode("ascii"),
+    }
+
+
+def _lan_stream_password_verifier(
+    record: object,
+) -> tuple[bytes, bytes, int] | None:
+    if not isinstance(record, dict):
+        return None
+    try:
+        if record.get("algorithm") != "pbkdf2_sha256":
+            return None
+        iterations = int(record["iterations"])
+        salt = base64.b64decode(str(record["salt"]), validate=True)
+        password_hash = base64.b64decode(str(record["hash"]), validate=True)
+    except (KeyError, TypeError, ValueError, UnicodeError):
+        return None
+    if (
+        iterations < 1
+        or len(salt) < LAN_STREAM_PASSWORD_SALT_BYTES
+        or len(password_hash) != hashlib.sha256().digest_size
+    ):
+        return None
+    return salt, password_hash, iterations
+
+
+def load_lan_stream_options() -> tuple[int, int, tuple[bytes, bytes, int] | None]:
     payload = load_settings_payload()
     options = payload.get(LAN_STREAM_SETTINGS_KEY)
     if not isinstance(options, dict):
-        return LAN_STREAM_DEFAULT_PORT, LAN_STREAM_DEFAULT_QUALITY
+        return LAN_STREAM_DEFAULT_PORT, LAN_STREAM_DEFAULT_QUALITY, None
     try:
         port = int(options.get("port", LAN_STREAM_DEFAULT_PORT))
     except (TypeError, ValueError):
@@ -1214,15 +1256,28 @@ def load_lan_stream_options() -> tuple[int, int]:
         quality = LAN_STREAM_DEFAULT_QUALITY
     port = min(max(port, 1), 65535)
     quality = min(max(quality, LAN_STREAM_MIN_QUALITY), LAN_STREAM_MAX_QUALITY)
-    return port, quality
+    return port, quality, _lan_stream_password_verifier(options.get("password"))
 
 
-def save_lan_stream_options(port: int, quality: int) -> None:
+def save_lan_stream_options(
+    port: int,
+    quality: int,
+    password_record: dict[str, str | int] | None = None,
+    preserve_password: bool = False,
+) -> None:
     payload = load_settings_payload()
+    previous_options = payload.get(LAN_STREAM_SETTINGS_KEY)
+    saved_password_record: object = None
+    if preserve_password and isinstance(previous_options, dict):
+        saved_password_record = previous_options.get("password")
+    elif password_record is not None:
+        saved_password_record = password_record
     payload[LAN_STREAM_SETTINGS_KEY] = {
         "port": int(port),
         "quality": int(quality),
     }
+    if saved_password_record is not None:
+        payload[LAN_STREAM_SETTINGS_KEY]["password"] = saved_password_record
     save_settings_payload(payload)
 
 
@@ -1245,6 +1300,35 @@ def lan_camera_id(camera_index: int | str) -> str:
     return f"{readable[:40]}-{digest}"
 
 
+def _parse_basic_authorization(value: str | None) -> tuple[str, str] | None:
+    if not value:
+        return None
+    scheme, separator, encoded = value.partition(" ")
+    if not separator or scheme.casefold() != "basic" or not encoded:
+        return None
+    try:
+        decoded = base64.b64decode(encoded.encode("ascii"), validate=True).decode("utf-8")
+    except (UnicodeError, ValueError):
+        return None
+    username, separator, password = decoded.partition(":")
+    if not separator:
+        return None
+    return username, password
+
+
+def _verify_lan_stream_password(
+    password: str, verifier: tuple[bytes, bytes, int]
+) -> bool:
+    salt, expected_hash, iterations = verifier
+    actual_hash = hashlib.pbkdf2_hmac(
+        "sha256",
+        password.encode("utf-8"),
+        salt,
+        iterations,
+    )
+    return hmac.compare_digest(actual_hash, expected_hash)
+
+
 class _LANStreamRequestHandler(BaseHTTPRequestHandler):
     """HTTP endpoints used by the embedded LAN preview server."""
 
@@ -1260,6 +1344,9 @@ class _LANStreamRequestHandler(BaseHTTPRequestHandler):
         return
 
     def do_GET(self) -> None:  # noqa: N802 - required by BaseHTTPRequestHandler
+        if not self.stream_server.authorize(self.headers.get("Authorization")):
+            self._send_authentication_required()
+            return
         parsed = urlsplit(self.path)
         path = unquote(parsed.path)
         if path in {"", "/"}:
@@ -1279,6 +1366,23 @@ class _LANStreamRequestHandler(BaseHTTPRequestHandler):
                 self._send_bytes(frame, "image/jpeg")
             return
         self._send_error(HTTPStatus.NOT_FOUND, "Not found.")
+
+    def _send_authentication_required(self) -> None:
+        payload = b"401 Password required."
+        try:
+            self.send_response(HTTPStatus.UNAUTHORIZED)
+            self.send_header(
+                "WWW-Authenticate",
+                'Basic realm="Camera Preview", charset="UTF-8"',
+            )
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(payload)))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(payload)
+        except (BrokenPipeError, ConnectionResetError, TimeoutError, OSError):
+            pass
 
     def _send_html(self, content: str) -> None:
         self._send_bytes(content.encode("utf-8"), "text/html; charset=utf-8")
@@ -1351,9 +1455,15 @@ class _LANThreadingHTTPServer(ThreadingHTTPServer):
 class LANStreamServer:
     """Small dependency-free MJPEG server for cameras opened by the app."""
 
-    def __init__(self, port: int, quality: int) -> None:
+    def __init__(
+        self,
+        port: int,
+        quality: int,
+        password_verifier: tuple[bytes, bytes, int] | None = None,
+    ) -> None:
         self.port = int(port)
         self.quality = int(quality)
+        self.password_verifier = password_verifier
         self.stopping = False
         self._panels_lock = threading.RLock()
         self._panels: dict[str, "CameraPanel"] = {}
@@ -1409,6 +1519,22 @@ class LANStreamServer:
     def has_camera(self, camera_id: str) -> bool:
         with self._panels_lock:
             return camera_id in self._panels
+
+    @property
+    def password_protected(self) -> bool:
+        return self.password_verifier is not None
+
+    def authorize(self, authorization: str | None) -> bool:
+        verifier = self.password_verifier
+        if verifier is None:
+            return True
+        credentials = _parse_basic_authorization(authorization)
+        if credentials is None:
+            return False
+        username, password = credentials
+        username_valid = hmac.compare_digest(username, LAN_STREAM_AUTH_USERNAME)
+        password_valid = _verify_lan_stream_password(password, verifier)
+        return username_valid and password_valid
 
     def _panel(self, camera_id: str) -> "CameraPanel | None":
         with self._panels_lock:
@@ -2029,7 +2155,11 @@ class CameraManager:
         self._borderless_fit_after_id: str | None = None
         self._network_dialog_cleanups: set = set()
         self.shutting_down = False
-        self.lan_stream_port, self.lan_stream_quality = load_lan_stream_options()
+        (
+            self.lan_stream_port,
+            self.lan_stream_quality,
+            self.lan_stream_password_verifier,
+        ) = load_lan_stream_options()
         self.lan_stream_server: LANStreamServer | None = None
         self.lan_stream_button: ttk.Button | None = None
         self._hotkey_poll_after_id: str | None = None
@@ -2082,25 +2212,51 @@ class CameraManager:
             server.stop()
         self._update_lan_stream_button()
 
-    def start_lan_stream(self, port: int, quality: int) -> LANStreamServer:
+    def start_lan_stream(
+        self,
+        port: int,
+        quality: int,
+        password: str | None = None,
+        clear_password: bool = False,
+    ) -> LANStreamServer:
         if not (1 <= port <= 65535):
             raise ValueError("\u7aef\u53e3\u5fc5\u987b\u5728 1 \u5230 65535 \u4e4b\u95f4\u3002")
         if not (LAN_STREAM_MIN_QUALITY <= quality <= LAN_STREAM_MAX_QUALITY):
             raise ValueError(
                 f"JPEG \u753b\u8d28\u5fc5\u987b\u5728 {LAN_STREAM_MIN_QUALITY} \u5230 {LAN_STREAM_MAX_QUALITY} \u4e4b\u95f4\u3002"
             )
+        if password is not None and not password:
+            password = None
+        if password is not None and len(password) < 4:
+            raise ValueError("\u62c9\u6d41\u5bc6\u7801\u81f3\u5c11\u9700\u8981 4 \u4e2a\u5b57\u7b26\u3002")
+        password_record: dict[str, str | int] | None = None
+        if password is not None:
+            password_record = _lan_stream_password_record(password)
+            password_verifier = _lan_stream_password_verifier(password_record)
+            if password_verifier is None:
+                raise RuntimeError("\u65e0\u6cd5\u8bbe\u7f6e\u62c9\u6d41\u5bc6\u7801\u3002")
+        elif clear_password:
+            password_verifier = None
+        else:
+            password_verifier = self.lan_stream_password_verifier
         self.stop_lan_stream()
         try:
-            server = LANStreamServer(port, quality)
+            server = LANStreamServer(port, quality, password_verifier)
             server.set_panels(self.windows.values())
             server.start()
         except OSError as error:
             raise RuntimeError(f"\u65e0\u6cd5\u76d1\u542c\u7aef\u53e3 {port}\uff1a{error}") from error
         self.lan_stream_port = server.port
         self.lan_stream_quality = quality
+        self.lan_stream_password_verifier = password_verifier
         self.lan_stream_server = server
         try:
-            save_lan_stream_options(server.port, quality)
+            save_lan_stream_options(
+                server.port,
+                quality,
+                password_record=password_record,
+                preserve_password=password is None and not clear_password,
+            )
         except OSError:
             pass
         self._update_lan_stream_button()
@@ -2111,7 +2267,8 @@ class CameraManager:
         if server is None:
             return "\u5c40\u57df\u7f51\u63a8\u6d41\u672a\u542f\u52a8\u3002"
         urls = server.urls()
-        return "\u5df2\u542f\u52a8\uff1a\n" + "\n".join(urls)
+        protection = "\u5df2\u542f\u7528\u5bc6\u7801\u4fdd\u62a4\u3002" if server.password_protected else "\u672a\u542f\u7528\u5bc6\u7801\u4fdd\u62a4\u3002"
+        return f"\u5df2\u542f\u52a8\uff08{protection}\uff09\uff1a\n" + "\n".join(urls)
 
     def open_lan_stream_dialog(self, parent) -> None:
         if self.shutting_down:
@@ -2144,6 +2301,45 @@ class CameraManager:
             textvariable=quality_var,
             width=7,
         ).grid(row=0, column=3, sticky=tk.W, padx=(8, 0))
+        password_frame = ttk.Frame(container)
+        password_frame.pack(fill=tk.X, pady=(10, 0))
+        password_enabled_var = tk.BooleanVar(
+            value=self.lan_stream_password_verifier is not None
+        )
+        password_entry_var = tk.StringVar()
+        password_confirm_var = tk.StringVar()
+        password_enabled = ttk.Checkbutton(
+            password_frame,
+            text="\u542f\u7528\u62c9\u6d41\u5bc6\u7801",
+            variable=password_enabled_var,
+        )
+        password_enabled.grid(row=0, column=0, columnspan=2, sticky=tk.W)
+        ttk.Label(password_frame, text="\u5bc6\u7801").grid(
+            row=1, column=0, sticky=tk.W, pady=(6, 0)
+        )
+        password_entry = ttk.Entry(
+            password_frame,
+            textvariable=password_entry_var,
+            width=24,
+            show="*",
+        )
+        password_entry.grid(row=1, column=1, sticky=tk.W, padx=(8, 0), pady=(6, 0))
+        ttk.Label(password_frame, text="\u786e\u8ba4\u5bc6\u7801").grid(
+            row=2, column=0, sticky=tk.W, pady=(6, 0)
+        )
+        password_confirm_entry = ttk.Entry(
+            password_frame,
+            textvariable=password_confirm_var,
+            width=24,
+            show="*",
+        )
+        password_confirm_entry.grid(
+            row=2, column=1, sticky=tk.W, padx=(8, 0), pady=(6, 0)
+        )
+        password_note_var = tk.StringVar()
+        ttk.Label(password_frame, textvariable=password_note_var).grid(
+            row=3, column=0, columnspan=2, sticky=tk.W, pady=(5, 0)
+        )
         status_var = tk.StringVar(value=self._lan_stream_status_text())
         status_label = ttk.Label(
             container, textvariable=status_var, justify=tk.LEFT, wraplength=520
@@ -2160,6 +2356,24 @@ class CameraManager:
         )
         pull_selector.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 0))
         pull_entries: list[tuple[str, str]] = []
+
+        def update_password_controls() -> None:
+            enabled = password_enabled_var.get()
+            state = tk.NORMAL if enabled else tk.DISABLED
+            password_entry.configure(state=state)
+            password_confirm_entry.configure(state=state)
+            if not enabled:
+                password_note_var.set(
+                    "\u672a\u542f\u7528\u5bc6\u7801\uff1a\u4efb\u610f\u5c40\u57df\u7f51\u8bbe\u5907\u90fd\u53ef\u8bbf\u95ee\u3002"
+                )
+            elif self.lan_stream_password_verifier is not None:
+                password_note_var.set(
+                    "\u5df2\u8bbe\u7f6e\u5bc6\u7801\uff1b\u7559\u7a7a\u4e24\u4e2a\u8f93\u5165\u6846\u53ef\u4fdd\u7559\u539f\u5bc6\u7801\u3002"
+                )
+            else:
+                password_note_var.set(
+                    "\u9996\u6b21\u542f\u7528\u65f6\u9700\u8f93\u5165\u5e76\u786e\u8ba4\u5bc6\u7801\u3002"
+                )
 
         def refresh_status() -> None:
             status_var.set(self._lan_stream_status_text())
@@ -2188,13 +2402,28 @@ class CameraManager:
             try:
                 port = int(port_var.get().strip())
                 quality = int(quality_var.get().strip())
-                server = self.start_lan_stream(port, quality)
+                password = password_entry_var.get()
+                confirmation = password_confirm_var.get()
+                if password_enabled_var.get():
+                    if password or confirmation:
+                        if password != confirmation:
+                            raise ValueError("\u4e24\u6b21\u8f93\u5165\u7684\u5bc6\u7801\u4e0d\u4e00\u81f4\u3002")
+                    elif self.lan_stream_password_verifier is None:
+                        raise ValueError("\u8bf7\u8f93\u5165\u5e76\u786e\u8ba4\u62c9\u6d41\u5bc6\u7801\u3002")
+                    server = self.start_lan_stream(port, quality, password or None)
+                else:
+                    server = self.start_lan_stream(
+                        port, quality, clear_password=True
+                    )
             except (ValueError, RuntimeError) as error:
                 status_var.set(str(error))
                 return
+            password_entry_var.set("")
+            password_confirm_var.set("")
             port_var.set(str(server.port))
             refresh_status()
             refresh_pull_urls()
+            update_password_controls()
 
         def stop() -> None:
             self.stop_lan_stream()
@@ -2253,6 +2482,8 @@ class CameraManager:
         )
         ttk.Button(buttons, text="\u5173\u95ed", command=close_dialog).pack(side=tk.RIGHT)
         dialog.protocol("WM_DELETE_WINDOW", close_dialog)
+        password_enabled.configure(command=update_password_controls)
+        update_password_controls()
         refresh_pull_urls()
         dialog.after_idle(lambda: self._center_window(dialog, parent))
 
@@ -3465,6 +3696,10 @@ class CameraManager:
             state="normal",
         )
         stream_selector.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 0))
+        ttk.Label(
+            container,
+            text="\u5bc6\u7801\u4fdd\u62a4\u62c9\u6d41\uff1a\u7528\u6237\u540d\u586b camera\uff0c\u5bc6\u7801\u586b\u63a8\u6d41\u7aef\u8bbe\u7f6e\u7684\u5bc6\u7801\u3002",
+        ).pack(anchor=tk.W, pady=(5, 0))
 
         status_var = tk.StringVar(
             value="\u53ef\u641c\u7d22 ONVIF\uff0c\u6216\u7c98\u8d34 RTSP / HTTP MJPEG \u5730\u5740\u3002"
@@ -3595,6 +3830,10 @@ class CameraManager:
             except ValueError as error:
                 status_var.set(str(error))
                 return
+            username = username_var.get().strip()
+            password = password_var.get()
+            if username:
+                stream_url = _with_rtsp_credentials(stream_url, username, password)
             start_operation(
                 "connect",
                 "\u6b63\u5728\u8fde\u63a5\u7f51\u7edc\u89c6\u9891\u6d41...",
