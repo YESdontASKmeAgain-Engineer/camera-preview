@@ -1517,6 +1517,30 @@ class LANStreamServer:
             addresses.add("127.0.0.1")
         return [f"http://{address}:{self.port}/" for address in sorted(addresses)]
 
+    def stream_urls(self) -> list[tuple[str, str]]:
+        """Return named direct MJPEG URLs for other applications to pull."""
+        base_urls = self.urls()
+        with self._panels_lock:
+            cameras = [
+                (camera_id, panel.camera_name)
+                for camera_id, panel in self._panels.items()
+            ]
+        streams: list[tuple[str, str]] = []
+        multiple_addresses = len(base_urls) > 1
+        for camera_id, camera_name in cameras:
+            safe_camera_id = quote(camera_id, safe="")
+            for base_url in base_urls:
+                address = urlsplit(base_url).hostname or base_url
+                label = (
+                    f"{camera_name} ({address})"
+                    if multiple_addresses
+                    else camera_name
+                )
+                streams.append(
+                    (label, f"{base_url}stream/{safe_camera_id}.mjpg")
+                )
+        return streams
+
 
 class CameraPanel:
     """One camera feed rendered as a draggable panel in the shared workspace."""
@@ -2125,10 +2149,40 @@ class CameraManager:
             container, textvariable=status_var, justify=tk.LEFT, wraplength=520
         )
         status_label.pack(anchor=tk.W, pady=(12, 0))
+        pull_frame = ttk.Frame(container)
+        pull_frame.pack(fill=tk.X, pady=(10, 0))
+        ttk.Label(pull_frame, text="\u5355\u8def\u62c9\u6d41\u5730\u5740").pack(side=tk.LEFT)
+        pull_url_var = tk.StringVar()
+        pull_selector = ttk.Combobox(
+            pull_frame,
+            textvariable=pull_url_var,
+            state="readonly",
+        )
+        pull_selector.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 0))
+        pull_entries: list[tuple[str, str]] = []
 
         def refresh_status() -> None:
             status_var.set(self._lan_stream_status_text())
             self._update_lan_stream_button()
+
+        def refresh_pull_urls() -> None:
+            nonlocal pull_entries
+            server = self.lan_stream_server
+            pull_entries = server.stream_urls() if server is not None else []
+            pull_selector.configure(
+                values=[f"{label} | {address}" for label, address in pull_entries]
+            )
+            if pull_entries:
+                pull_selector.current(0)
+                pull_url_var.set(f"{pull_entries[0][0]} | {pull_entries[0][1]}")
+            else:
+                pull_url_var.set("")
+
+        def selected_pull_url() -> str | None:
+            selection = pull_selector.current()
+            if 0 <= selection < len(pull_entries):
+                return pull_entries[selection][1]
+            return None
 
         def start() -> None:
             try:
@@ -2140,10 +2194,12 @@ class CameraManager:
                 return
             port_var.set(str(server.port))
             refresh_status()
+            refresh_pull_urls()
 
         def stop() -> None:
             self.stop_lan_stream()
             refresh_status()
+            refresh_pull_urls()
 
         def copy_url() -> None:
             server = self.lan_stream_server
@@ -2164,6 +2220,20 @@ class CameraManager:
                 return
             status_var.set(f"\u5df2\u590d\u5236\u7f51\u5740\uff1a\n{address}")
 
+        def copy_pull_url() -> None:
+            address = selected_pull_url()
+            if address is None:
+                status_var.set("\u8bf7\u5148\u542f\u52a8\u63a8\u6d41\u5e76\u6253\u5f00\u4e00\u8def\u6444\u50cf\u5934\u3002")
+                return
+            try:
+                dialog.clipboard_clear()
+                dialog.clipboard_append(address)
+                dialog.update_idletasks()
+            except tk.TclError:
+                status_var.set("\u65e0\u6cd5\u8bbf\u95ee\u7cfb\u7edf\u526a\u8d34\u677f\u3002")
+                return
+            status_var.set(f"\u5df2\u590d\u5236\u5355\u8def\u62c9\u6d41\u5730\u5740\uff1a\n{address}")
+
         def close_dialog() -> None:
             try:
                 dialog.grab_release()
@@ -2178,8 +2248,12 @@ class CameraManager:
         ttk.Button(buttons, text="\u590d\u5236\u7f51\u5740", command=copy_url).pack(
             side=tk.LEFT, padx=(8, 0)
         )
+        ttk.Button(buttons, text="\u590d\u5236\u62c9\u6d41\u5730\u5740", command=copy_pull_url).pack(
+            side=tk.LEFT, padx=(8, 0)
+        )
         ttk.Button(buttons, text="\u5173\u95ed", command=close_dialog).pack(side=tk.RIGHT)
         dialog.protocol("WM_DELETE_WINDOW", close_dialog)
+        refresh_pull_urls()
         dialog.after_idle(lambda: self._center_window(dialog, parent))
 
     @staticmethod
@@ -3383,7 +3457,7 @@ class CameraManager:
 
         stream_row = ttk.Frame(container)
         stream_row.pack(fill=tk.X, pady=(10, 0))
-        ttk.Label(stream_row, text="RTSP \u5730\u5740").pack(side=tk.LEFT)
+        ttk.Label(stream_row, text="\u89c6\u9891\u6d41\u5730\u5740").pack(side=tk.LEFT)
         stream_url_var = tk.StringVar()
         stream_selector = ttk.Combobox(
             stream_row,
@@ -3392,7 +3466,9 @@ class CameraManager:
         )
         stream_selector.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 0))
 
-        status_var = tk.StringVar(value="\u70b9\u51fb\u641c\u7d22\u53d1\u73b0\u5c40\u57df\u7f51 ONVIF \u6444\u50cf\u5934\u3002")
+        status_var = tk.StringVar(
+            value="\u53ef\u641c\u7d22 ONVIF\uff0c\u6216\u7c98\u8d34 RTSP / HTTP MJPEG \u5730\u5740\u3002"
+        )
         ttk.Label(container, textvariable=status_var).pack(anchor=tk.W, pady=(8, 0))
 
         buttons = ttk.Frame(container)
@@ -3521,7 +3597,7 @@ class CameraManager:
                 return
             start_operation(
                 "connect",
-                "\u6b63\u5728\u8fde\u63a5\u7f51\u7edc\u6444\u50cf\u5934...",
+                "\u6b63\u5728\u8fde\u63a5\u7f51\u7edc\u89c6\u9891\u6d41...",
                 lambda: open_network_capture(stream_url),
             )
 
@@ -3562,7 +3638,7 @@ class CameraManager:
                     elif operation == "connect":
                         opened = result
                         if self.add_camera(opened):
-                            status_var.set("\u5df2\u6dfb\u52a0\u7f51\u7edc\u6444\u50cf\u5934\u3002")
+                            status_var.set("\u5df2\u6dfb\u52a0\u7f51\u7edc\u89c6\u9891\u6d41\u3002")
                             close_dialog()
                         else:
                             status_var.set("\u8fd9\u4e2a\u7f51\u7edc\u6444\u50cf\u5934\u5df2\u7ecf\u6253\u5f00\u3002")

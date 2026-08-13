@@ -68,6 +68,11 @@ direct MJPEG video-stream link plus a single-frame JPEG link for each one. The
 streams update as cameras are added or closed. Stop the stream from the same dialog;
 it also stops automatically when Camera Preview exits.
 
+To feed another application, select the camera under the single-stream pull address
+list and choose `Copy pull URL`. Paste the resulting
+`http://.../stream/...mjpg` address into an application that accepts HTTP MJPEG
+input. The normal `Copy URL` button copies the browser overview page instead.
+
 Windows may ask whether to allow Camera Preview through the firewall the first time
 the stream starts. Allow it on `Private networks` to make the address accessible to
 other devices on the LAN. This lightweight mode is designed for browser preview and
