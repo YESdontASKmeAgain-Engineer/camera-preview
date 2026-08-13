@@ -217,6 +217,11 @@ MIN_WINDOW_WIDTH = 480
 MIN_WINDOW_HEIGHT = 360
 MAX_WINDOW_DIMENSION = 10000
 MAX_WINDOW_COORDINATE = 100000
+SM_XVIRTUALSCREEN = 76
+SM_YVIRTUALSCREEN = 77
+SM_CXVIRTUALSCREEN = 78
+SM_CYVIRTUALSCREEN = 79
+WINDOW_RECOVERY_MARGIN = 60
 PURE_RESIZE_BORDER = 10
 MIN_PURE_WINDOW_WIDTH = 160
 MIN_PURE_WINDOW_HEIGHT = 120
@@ -295,6 +300,57 @@ class WindowPlacement:
             "width": self.width,
             "height": self.height,
         }
+
+
+def virtual_desktop_bounds() -> tuple[int, int, int, int]:
+    """Return the full Windows desktop bounds, including secondary displays."""
+    if sys.platform == "win32":
+        try:
+            user32 = ctypes.windll.user32
+            left = int(user32.GetSystemMetrics(SM_XVIRTUALSCREEN))
+            top = int(user32.GetSystemMetrics(SM_YVIRTUALSCREEN))
+            width = int(user32.GetSystemMetrics(SM_CXVIRTUALSCREEN))
+            height = int(user32.GetSystemMetrics(SM_CYVIRTUALSCREEN))
+            if width > 0 and height > 0:
+                return left, top, width, height
+        except (AttributeError, OSError):
+            pass
+    return 0, 0, 1920, 1080
+
+
+def normalize_top_level_placement(
+    placement: WindowPlacement,
+    min_width: int = MIN_WINDOW_WIDTH,
+    min_height: int = MIN_WINDOW_HEIGHT,
+) -> WindowPlacement:
+    """Keep a saved top-level window within the current virtual desktop."""
+    screen_left, screen_top, screen_width, screen_height = virtual_desktop_bounds()
+    screen_right = screen_left + screen_width
+    screen_bottom = screen_top + screen_height
+    width = min(max(placement.width, min_width), max(min_width, screen_width))
+    height = min(max(placement.height, min_height), max(min_height, screen_height))
+    is_visible = (
+        placement.x < screen_right
+        and placement.x + width > screen_left
+        and placement.y < screen_bottom
+        and placement.y + height > screen_top
+    )
+    if not is_visible:
+        return WindowPlacement(
+            x=screen_left + min(WINDOW_RECOVERY_MARGIN, max(0, screen_width - width)),
+            y=screen_top + min(WINDOW_RECOVERY_MARGIN, max(0, screen_height - height)),
+            width=width,
+            height=height,
+        )
+
+    max_x = max(screen_left, screen_right - width)
+    max_y = max(screen_top, screen_bottom - height)
+    return WindowPlacement(
+        x=min(max(placement.x, screen_left), max_x),
+        y=min(max(placement.y, screen_top), max_y),
+        width=width,
+        height=height,
+    )
 
 
 def is_valid_hotkey(hotkey: GlobalHotkey) -> bool:
@@ -1065,24 +1121,28 @@ def load_main_window_placement() -> WindowPlacement | None:
         load_settings_payload().get(MAIN_WINDOW_PLACEMENT_KEY)
     )
     if placement is not None:
-        return placement
+        return normalize_top_level_placement(placement)
 
     # Preserve the screen location from the former one-window-per-camera layout.
     legacy_placements = load_window_placements()
     legacy = next(iter(legacy_placements.values()), None)
     if legacy is None:
         return None
-    return WindowPlacement(
-        x=legacy.x,
-        y=legacy.y,
-        width=DEFAULT_MAIN_WINDOW_WIDTH,
-        height=DEFAULT_MAIN_WINDOW_HEIGHT,
+    return normalize_top_level_placement(
+        WindowPlacement(
+            x=legacy.x,
+            y=legacy.y,
+            width=DEFAULT_MAIN_WINDOW_WIDTH,
+            height=DEFAULT_MAIN_WINDOW_HEIGHT,
+        )
     )
 
 
 def save_main_window_placement(placement: WindowPlacement) -> None:
     payload = load_settings_payload()
-    payload[MAIN_WINDOW_PLACEMENT_KEY] = placement.to_payload()
+    payload[MAIN_WINDOW_PLACEMENT_KEY] = normalize_top_level_placement(
+        placement
+    ).to_payload()
     save_settings_payload(payload)
 
 
@@ -1094,17 +1154,25 @@ def load_borderless_window_placement() -> WindowPlacement | None:
     )
     if placement is None:
         return None
-    return WindowPlacement(
-        x=placement.x,
-        y=placement.y,
-        width=max(MIN_PURE_WINDOW_WIDTH, placement.width),
-        height=max(MIN_PURE_WINDOW_HEIGHT, placement.height),
+    return normalize_top_level_placement(
+        WindowPlacement(
+            x=placement.x,
+            y=placement.y,
+            width=max(MIN_PURE_WINDOW_WIDTH, placement.width),
+            height=max(MIN_PURE_WINDOW_HEIGHT, placement.height),
+        ),
+        min_width=MIN_PURE_WINDOW_WIDTH,
+        min_height=MIN_PURE_WINDOW_HEIGHT,
     )
 
 
 def save_borderless_window_placement(placement: WindowPlacement) -> None:
     payload = load_settings_payload()
-    payload[BORDERLESS_WINDOW_PLACEMENT_KEY] = placement.to_payload()
+    payload[BORDERLESS_WINDOW_PLACEMENT_KEY] = normalize_top_level_placement(
+        placement,
+        min_width=MIN_PURE_WINDOW_WIDTH,
+        min_height=MIN_PURE_WINDOW_HEIGHT,
+    ).to_payload()
     save_settings_payload(payload)
 
 
@@ -2665,33 +2733,23 @@ class CameraManager:
         except tk.TclError:
             return
 
-        self._borderless_preview_position = (window_x, window_y)
-        borderless_placement = WindowPlacement(
-            x=window_x,
-            y=window_y,
-            width=window_width,
-            height=window_height,
+        borderless_placement = normalize_top_level_placement(
+            WindowPlacement(
+                x=window_x,
+                y=window_y,
+                width=window_width,
+                height=window_height,
+            ),
+            min_width=MIN_PURE_WINDOW_WIDTH,
+            min_height=MIN_PURE_WINDOW_HEIGHT,
+        )
+        self._borderless_preview_position = (
+            borderless_placement.x,
+            borderless_placement.y,
         )
         self._saved_borderless_placement = borderless_placement
         try:
             save_borderless_window_placement(borderless_placement)
-        except OSError:
-            pass
-        base = self._windowed_preview_placement
-        if base is None:
-            return
-        offset_x, offset_y = self._windowed_workspace_offset
-        content_x, content_y = self._borderless_content_offset
-        placement = WindowPlacement(
-            x=window_x - offset_x - content_x,
-            y=window_y - offset_y - content_y,
-            width=base.width,
-            height=base.height,
-        )
-        self._windowed_preview_placement = placement
-        self.main_window_placement = placement
-        try:
-            save_main_window_placement(placement)
         except OSError:
             pass
 
@@ -2720,6 +2778,7 @@ class CameraManager:
             self.borderless = False
             self._apply_preview_display_options()
             self._restore_windowed_layout()
+            self.remember_main_window_placement()
             self._borderless_preview_position = None
             self._borderless_window_drag_offset = None
             self._borderless_resize_edges = None
