@@ -1276,6 +1276,10 @@ class _LANStreamRequestHandler(BaseHTTPRequestHandler):
             return
 
 
+class _LANThreadingHTTPServer(ThreadingHTTPServer):
+    allow_reuse_address = True
+
+
 class LANStreamServer:
     """Small dependency-free MJPEG server for cameras opened by the app."""
 
@@ -1289,7 +1293,9 @@ class LANStreamServer:
         self._jpeg_cache: dict[str, tuple[int, int, bytes]] = {}
         self._jpeg_encode_locks: dict[str, threading.Lock] = {}
         self._frame_event = threading.Event()
-        self.httpd = ThreadingHTTPServer(("0.0.0.0", self.port), _LANStreamRequestHandler)
+        self.httpd = _LANThreadingHTTPServer(
+            ("0.0.0.0", self.port), _LANStreamRequestHandler
+        )
         self.httpd.daemon_threads = True
         self.httpd.stream_server = self  # type: ignore[attr-defined]
         self.port = int(self.httpd.server_address[1])
