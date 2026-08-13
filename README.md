@@ -12,6 +12,7 @@ A lightweight Windows desktop application for viewing UVC and ONVIF camera feeds
 - Pure-picture mode hides the app border, toolbar, and camera panel controls
 - Pure-picture mode can be moved by dragging and resized from its edges or corners
 - Local-network ONVIF camera discovery, RTSP address lookup, and manual RTSP connection
+- Built-in LAN MJPEG streaming to a browser, with no OBS installation required
 - Mouse-wheel zoom centered on the cursor
 - Standard Windows close button, plus keyboard shortcuts
 - Screenshot capture
@@ -50,6 +51,32 @@ device, enter its credentials if required, and choose Read RTSP to fill the stre
 address automatically. A known RTSP address can also be pasted directly and opened with
 Add Preview. When no USB camera is available, the application opens a small
 launcher with the same network-search action.
+
+## Built-In LAN Streaming
+
+Click `局域网推流` in the toolbar, leave the default port at `8080`, and click
+`启动/重启`. The dialog shows the addresses available on this computer. On another
+device connected to the same LAN, open the displayed address in a browser, for
+example:
+
+```text
+http://192.168.10.25:8080/
+```
+
+The page displays every camera currently open in the application and provides a
+direct MJPEG video-stream link plus a single-frame JPEG link for each one. The
+streams update as cameras are added or closed. Stop the stream from the same dialog;
+it also stops automatically when Camera Preview exits.
+
+To feed another application, select the camera under the single-stream pull address
+list and choose `Copy pull URL`. Paste the resulting
+`http://.../stream/...mjpg` address into an application that accepts HTTP MJPEG
+input. The normal `Copy URL` button copies the browser overview page instead.
+
+Windows may ask whether to allow Camera Preview through the firewall the first time
+the stream starts. Allow it on `Private networks` to make the address accessible to
+other devices on the LAN. This lightweight mode is designed for browser preview and
+uses JPEG compression; for RTSP/H.264 output, use a dedicated video encoder/server.
 
 To open only selected cameras, repeat `--camera`:
 
@@ -91,7 +118,8 @@ and its `_internal` folder together when moving the application.
 The application never stores its own persistent data in `AppData`, `LocalAppData`,
 or `Roaming`. `camera_preview_settings.json` is created beside
 `CameraPreview.exe` and holds the hotkey, window location, panel layout, and display
-mode. Screenshots are saved to the `screenshots` folder beside the executable.
+mode, plus LAN-stream port and quality settings. Screenshots are saved to the
+`screenshots` folder beside the executable.
 
 ## License
 
