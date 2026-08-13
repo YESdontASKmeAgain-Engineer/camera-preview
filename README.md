@@ -73,6 +73,14 @@ list and choose `Copy pull URL`. Paste the resulting
 `http://.../stream/...mjpg` address into an application that accepts HTTP MJPEG
 input. The normal `Copy URL` button copies the browser overview page instead.
 
+The LAN-stream dialog can enable password protection. Set a password and confirm
+it, then restart the stream. Every browser, snapshot, and MJPEG request must use
+HTTP Basic credentials with username `camera` and that password. In Camera Preview's
+Network dialog, enter those credentials before adding the HTTP MJPEG address. The
+portable settings file stores only a salted PBKDF2 password hash, never the plaintext
+password. This protects access on the LAN; the stream is still HTTP, not HTTPS, so
+use a trusted network when the password itself must also be encrypted in transit.
+
 Windows may ask whether to allow Camera Preview through the firewall the first time
 the stream starts. Allow it on `Private networks` to make the address accessible to
 other devices on the LAN. This lightweight mode is designed for browser preview and
