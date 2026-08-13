@@ -2145,6 +2145,25 @@ class CameraManager:
             self.stop_lan_stream()
             refresh_status()
 
+        def copy_url() -> None:
+            server = self.lan_stream_server
+            if server is None:
+                status_var.set("\u8bf7\u5148\u542f\u52a8\u5c40\u57df\u7f51\u63a8\u6d41\uff0c\u518d\u590d\u5236\u7f51\u5740\u3002")
+                return
+            urls = server.urls()
+            if not urls:
+                status_var.set("\u672a\u627e\u5230\u53ef\u590d\u5236\u7684\u7f51\u5740\u3002")
+                return
+            address = urls[0]
+            try:
+                dialog.clipboard_clear()
+                dialog.clipboard_append(address)
+                dialog.update_idletasks()
+            except tk.TclError:
+                status_var.set("\u65e0\u6cd5\u8bbf\u95ee\u7cfb\u7edf\u526a\u8d34\u677f\u3002")
+                return
+            status_var.set(f"\u5df2\u590d\u5236\u7f51\u5740\uff1a\n{address}")
+
         def close_dialog() -> None:
             try:
                 dialog.grab_release()
@@ -2156,6 +2175,9 @@ class CameraManager:
         buttons.pack(fill=tk.X, pady=(14, 0))
         ttk.Button(buttons, text="\u542f\u52a8/\u91cd\u542f", command=start).pack(side=tk.LEFT)
         ttk.Button(buttons, text="\u505c\u6b62", command=stop).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(buttons, text="\u590d\u5236\u7f51\u5740", command=copy_url).pack(
+            side=tk.LEFT, padx=(8, 0)
+        )
         ttk.Button(buttons, text="\u5173\u95ed", command=close_dialog).pack(side=tk.RIGHT)
         dialog.protocol("WM_DELETE_WINDOW", close_dialog)
         dialog.after_idle(lambda: self._center_window(dialog, parent))
