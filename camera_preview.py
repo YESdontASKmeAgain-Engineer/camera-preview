@@ -6,6 +6,8 @@ import argparse
 import base64
 import ctypes
 import hashlib
+import html
+import ipaddress
 import json
 import os
 import queue
@@ -20,6 +22,8 @@ import xml.etree.ElementTree as ET
 from ctypes import wintypes
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from tkinter import messagebox, ttk
 from typing import Iterable
@@ -59,6 +63,12 @@ PANEL_PLACEMENTS_KEY = "panel_positions"
 MAIN_WINDOW_PLACEMENT_KEY = "main_window_position"
 PREVIEW_DISPLAY_OPTIONS_KEY = "preview_display_options"
 BORDERLESS_WINDOW_PLACEMENT_KEY = "borderless_window_position"
+LAN_STREAM_SETTINGS_KEY = "lan_stream_options"
+LAN_STREAM_DEFAULT_PORT = 8080
+LAN_STREAM_DEFAULT_QUALITY = 80
+LAN_STREAM_MIN_QUALITY = 20
+LAN_STREAM_MAX_QUALITY = 100
+LAN_STREAM_FPS = 30.0
 WM_HOTKEY = 0x0312
 WM_QUIT = 0x0012
 HOTKEY_ID = 0xCA01
@@ -1121,6 +1131,33 @@ def save_preview_display_options(always_on_top: bool, borderless: bool) -> None:
     save_settings_payload(payload)
 
 
+def load_lan_stream_options() -> tuple[int, int]:
+    payload = load_settings_payload()
+    options = payload.get(LAN_STREAM_SETTINGS_KEY)
+    if not isinstance(options, dict):
+        return LAN_STREAM_DEFAULT_PORT, LAN_STREAM_DEFAULT_QUALITY
+    try:
+        port = int(options.get("port", LAN_STREAM_DEFAULT_PORT))
+    except (TypeError, ValueError):
+        port = LAN_STREAM_DEFAULT_PORT
+    try:
+        quality = int(options.get("quality", LAN_STREAM_DEFAULT_QUALITY))
+    except (TypeError, ValueError):
+        quality = LAN_STREAM_DEFAULT_QUALITY
+    port = min(max(port, 1), 65535)
+    quality = min(max(quality, LAN_STREAM_MIN_QUALITY), LAN_STREAM_MAX_QUALITY)
+    return port, quality
+
+
+def save_lan_stream_options(port: int, quality: int) -> None:
+    payload = load_settings_payload()
+    payload[LAN_STREAM_SETTINGS_KEY] = {
+        "port": int(port),
+        "quality": int(quality),
+    }
+    save_settings_payload(payload)
+
+
 def save_frame(frame, camera_index: int | str) -> Path:
     screenshot_dir = portable_data_directory() / "screenshots"
     screenshot_dir.mkdir(exist_ok=True)
@@ -1130,6 +1167,281 @@ def save_frame(frame, camera_index: int | str) -> Path:
     if not cv2.imwrite(str(output_path), frame):
         raise RuntimeError(f"Could not save {output_path}")
     return output_path
+
+
+def lan_camera_id(camera_index: int | str) -> str:
+    """Return a stable URL-safe identifier for one camera source."""
+    raw = str(camera_index)
+    readable = re.sub(r"[^A-Za-z0-9_-]+", "-", raw).strip("-") or "camera"
+    digest = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:8]
+    return f"{readable[:40]}-{digest}"
+
+
+class _LANStreamRequestHandler(BaseHTTPRequestHandler):
+    """HTTP endpoints used by the embedded LAN preview server."""
+
+    server_version = "CameraPreviewLAN/1.0"
+    protocol_version = "HTTP/1.1"
+
+    @property
+    def stream_server(self) -> "LANStreamServer":
+        return self.server.stream_server  # type: ignore[attr-defined]
+
+    def log_message(self, _format: str, *_args) -> None:
+        # The GUI application has no console in the portable build.
+        return
+
+    def do_GET(self) -> None:  # noqa: N802 - required by BaseHTTPRequestHandler
+        parsed = urlsplit(self.path)
+        path = unquote(parsed.path)
+        if path in {"", "/"}:
+            self._send_html(self.stream_server.render_index())
+            return
+
+        stream_match = re.fullmatch(r"/stream/([^/]+)\.mjpg", path)
+        snapshot_match = re.fullmatch(r"/snapshot/([^/]+)\.jpg", path)
+        if stream_match:
+            self._serve_stream(stream_match.group(1))
+            return
+        if snapshot_match:
+            frame = self.stream_server.get_jpeg(snapshot_match.group(1))
+            if frame is None:
+                self._send_error(HTTPStatus.NOT_FOUND, "Camera frame is not available.")
+            else:
+                self._send_bytes(frame, "image/jpeg")
+            return
+        self._send_error(HTTPStatus.NOT_FOUND, "Not found.")
+
+    def _send_html(self, content: str) -> None:
+        self._send_bytes(content.encode("utf-8"), "text/html; charset=utf-8")
+
+    def _send_bytes(self, payload: bytes, content_type: str) -> None:
+        try:
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(payload)))
+            self.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
+            self.send_header("Pragma", "no-cache")
+            self.end_headers()
+            self.wfile.write(payload)
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, TimeoutError, OSError):
+            pass
+
+    def _send_error(self, status: HTTPStatus, message: str) -> None:
+        payload = f"{status.value} {html.escape(message)}".encode("utf-8")
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+        except (BrokenPipeError, ConnectionResetError, TimeoutError, OSError):
+            pass
+
+    def _serve_stream(self, camera_id: str) -> None:
+        boundary = b"camera-preview-frame"
+        last_frame_id = -1
+        try:
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=camera-preview-frame")
+            self.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
+            self.send_header("Pragma", "no-cache")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            while not self.stream_server.stopping:
+                jpeg = self.stream_server.get_jpeg_with_id(camera_id)
+                if jpeg is None:
+                    if not self.stream_server.has_camera(camera_id):
+                        return
+                    self.stream_server.wait_for_frame(0.1)
+                    continue
+                frame_id, frame = jpeg
+                if frame_id == last_frame_id:
+                    self.stream_server.wait_for_frame(1.0 / LAN_STREAM_FPS)
+                    continue
+                packet = (
+                    b"--" + boundary
+                    + b"\r\nContent-Type: image/jpeg\r\nContent-Length: "
+                    + str(len(frame)).encode("ascii")
+                    + b"\r\n\r\n"
+                    + frame
+                    + b"\r\n"
+                )
+                self.wfile.write(packet)
+                self.wfile.flush()
+                last_frame_id = frame_id
+                self.stream_server.wait_for_frame(1.0 / LAN_STREAM_FPS)
+        except (BrokenPipeError, ConnectionResetError, TimeoutError, OSError):
+            return
+
+
+class LANStreamServer:
+    """Small dependency-free MJPEG server for cameras opened by the app."""
+
+    def __init__(self, port: int, quality: int) -> None:
+        self.port = int(port)
+        self.quality = int(quality)
+        self.stopping = False
+        self._panels_lock = threading.RLock()
+        self._panels: dict[str, "CameraPanel"] = {}
+        self._cache_lock = threading.Lock()
+        self._jpeg_cache: dict[str, tuple[int, int, bytes]] = {}
+        self._jpeg_encode_locks: dict[str, threading.Lock] = {}
+        self._frame_event = threading.Event()
+        self.httpd = ThreadingHTTPServer(("0.0.0.0", self.port), _LANStreamRequestHandler)
+        self.httpd.daemon_threads = True
+        self.httpd.stream_server = self  # type: ignore[attr-defined]
+        self.port = int(self.httpd.server_address[1])
+        self.thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        self.stopping = False
+        self.thread = threading.Thread(
+            target=self.httpd.serve_forever,
+            kwargs={"poll_interval": 0.2},
+            name="camera-preview-lan-stream",
+            daemon=True,
+        )
+        self.thread.start()
+
+    def stop(self) -> None:
+        if self.stopping:
+            return
+        self.stopping = True
+        self._frame_event.set()
+        try:
+            self.httpd.shutdown()
+        finally:
+            self.httpd.server_close()
+        if self.thread is not None and self.thread.is_alive():
+            self.thread.join(timeout=1.5)
+        self.thread = None
+
+    def set_panels(self, panels: Iterable["CameraPanel"]) -> None:
+        mapping = {lan_camera_id(panel.camera_index): panel for panel in panels if panel.running}
+        with self._panels_lock:
+            self._panels = mapping
+            valid = set(mapping)
+        with self._cache_lock:
+            self._jpeg_cache = {
+                key: value for key, value in self._jpeg_cache.items() if key in valid
+            }
+            self._jpeg_encode_locks = {
+                key: value for key, value in self._jpeg_encode_locks.items() if key in valid
+            }
+        self._frame_event.set()
+
+    def has_camera(self, camera_id: str) -> bool:
+        with self._panels_lock:
+            return camera_id in self._panels
+
+    def _panel(self, camera_id: str) -> "CameraPanel | None":
+        with self._panels_lock:
+            return self._panels.get(camera_id)
+
+    def get_jpeg(self, camera_id: str) -> bytes | None:
+        jpeg = self.get_jpeg_with_id(camera_id)
+        return jpeg[1] if jpeg is not None else None
+
+    def get_jpeg_with_id(self, camera_id: str) -> tuple[int, bytes] | None:
+        panel = self._panel(camera_id)
+        if panel is None or not panel.running:
+            return None
+        frame_id = panel._latest_frame_sequence()
+        if not frame_id:
+            return None
+        with self._cache_lock:
+            cached = self._jpeg_cache.get(camera_id)
+            if cached is not None and cached[0] == frame_id and cached[1] == self.quality:
+                return frame_id, cached[2]
+
+            encode_lock = self._jpeg_encode_locks.setdefault(camera_id, threading.Lock())
+        with encode_lock:
+            frame_id = panel._latest_frame_sequence()
+            if not frame_id:
+                return None
+            with self._cache_lock:
+                cached = self._jpeg_cache.get(camera_id)
+                if (
+                    cached is not None
+                    and cached[0] == frame_id
+                    and cached[1] == self.quality
+                ):
+                    return frame_id, cached[2]
+            frame, frame_id = panel._take_latest_frame_with_id()
+            if frame is None:
+                return None
+            try:
+                ok, encoded = cv2.imencode(
+                    ".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), self.quality]
+                )
+            except cv2.error:
+                return None
+            if not ok:
+                return None
+            payload = encoded.tobytes()
+            with self._cache_lock:
+                self._jpeg_cache[camera_id] = (frame_id, self.quality, payload)
+            return frame_id, payload
+
+    def signal_frame_available(self) -> None:
+        self._frame_event.set()
+
+    def wait_for_frame(self, timeout: float) -> None:
+        self._frame_event.wait(max(0.001, timeout))
+        self._frame_event.clear()
+
+    def render_index(self) -> str:
+        with self._panels_lock:
+            cameras = [
+                (camera_id, panel.camera_name)
+                for camera_id, panel in self._panels.items()
+            ]
+        rows = []
+        for camera_id, name in cameras:
+            safe_id = quote(camera_id, safe="")
+            safe_name = html.escape(name)
+            stream_url = f"/stream/{safe_id}.mjpg"
+            snapshot_url = f"/snapshot/{safe_id}.jpg"
+            rows.append(
+                f'<section><h2>{safe_name}</h2><img src="{stream_url}" '
+                f'alt="{safe_name}"><p><a href="{stream_url}">\u5355\u8def\u89c6\u9891\u6d41</a> '
+                f'<a href="{snapshot_url}">\u5355\u5e27</a></p></section>'
+            )
+        if not rows:
+            rows.append("<p>\u5f53\u524d\u6ca1\u6709\u5df2\u6253\u5f00\u7684\u6444\u50cf\u5934\u3002</p>")
+        items = "".join(rows)
+        return (
+            "<!doctype html><html lang=\"zh-CN\"><meta charset=\"utf-8\">"
+            "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+            "<title>Camera Preview LAN</title>"
+            "<style>body{font-family:Segoe UI,Arial,sans-serif;margin:1.5rem;line-height:1.5}"
+            "main{display:grid;gap:1.25rem;grid-template-columns:repeat(auto-fit,minmax(320px,1fr))}"
+            "section{min-width:0}h1{grid-column:1/-1;margin:0}h2{font-size:1rem;margin:0 0 .5rem}"
+            "img{background:#111;display:block;height:auto;max-width:100%;width:100%}"
+            "p{margin:.5rem 0 0}a+a{margin-left:1rem}</style><main>"
+            "<h1>Camera Preview</h1>"
+            + items
+            + "</main></html>"
+        )
+
+    def urls(self) -> list[str]:
+        addresses: set[str] = set()
+        try:
+            host_name = socket.gethostname()
+            for address in socket.gethostbyname_ex(host_name)[2]:
+                try:
+                    parsed = ipaddress.ip_address(address)
+                except ValueError:
+                    continue
+                if parsed.version == 4 and not parsed.is_loopback:
+                    addresses.add(address)
+        except OSError:
+            pass
+        if not addresses:
+            addresses.add("127.0.0.1")
+        return [f"http://{address}:{self.port}/" for address in sorted(addresses)]
 
 
 class CameraPanel:
@@ -1157,6 +1469,7 @@ class CameraPanel:
         self.running = True
         self.frame_lock = threading.Lock()
         self.latest_frame = None
+        self.frame_sequence = 0
         self.frame_count = 0
         self.fps = 0.0
         self.fps_start = time.perf_counter()
@@ -1397,6 +1710,8 @@ class CameraPanel:
             with self.frame_lock:
                 self.latest_frame = frame
                 self.frame_count += 1
+                self.frame_sequence += 1
+            self.manager.notify_frame_available()
             if read_elapsed < self.frame_interval:
                 time.sleep(self.frame_interval - read_elapsed)
 
@@ -1405,6 +1720,16 @@ class CameraPanel:
             if self.latest_frame is None:
                 return None
             return self.latest_frame.copy()
+
+    def _take_latest_frame_with_id(self):
+        with self.frame_lock:
+            if self.latest_frame is None:
+                return None, 0
+            return self.latest_frame.copy(), self.frame_sequence
+
+    def _latest_frame_sequence(self) -> int:
+        with self.frame_lock:
+            return self.frame_sequence if self.latest_frame is not None else 0
 
     def _update_fps(self) -> None:
         now = time.perf_counter()
@@ -1606,6 +1931,9 @@ class CameraManager:
         self._borderless_fit_after_id: str | None = None
         self._network_dialog_cleanups: set = set()
         self.shutting_down = False
+        self.lan_stream_port, self.lan_stream_quality = load_lan_stream_options()
+        self.lan_stream_server: LANStreamServer | None = None
+        self.lan_stream_button: ttk.Button | None = None
         self._hotkey_poll_after_id: str | None = None
         self._close_after_id: str | None = None
         self.previews_hidden = False
@@ -1624,6 +1952,139 @@ class CameraManager:
 
         if not self.windows:
             self.show_launcher()
+
+    def notify_frame_available(self) -> None:
+        server = self.lan_stream_server
+        if server is not None:
+            server.signal_frame_available()
+
+    def _refresh_lan_stream_panels(self) -> None:
+        server = self.lan_stream_server
+        if server is not None:
+            server.set_panels(self.windows.values())
+
+    def _update_lan_stream_button(self) -> None:
+        if self.lan_stream_button is None:
+            return
+        try:
+            self.lan_stream_button.configure(
+                text=(
+                    f"\u63a8\u6d41\u4e2d ({self.lan_stream_server.port})"
+                    if self.lan_stream_server is not None
+                    else "\u5c40\u57df\u7f51\u63a8\u6d41"
+                )
+            )
+        except tk.TclError:
+            self.lan_stream_button = None
+
+    def stop_lan_stream(self) -> None:
+        server = self.lan_stream_server
+        self.lan_stream_server = None
+        if server is not None:
+            server.stop()
+        self._update_lan_stream_button()
+
+    def start_lan_stream(self, port: int, quality: int) -> LANStreamServer:
+        if not (1 <= port <= 65535):
+            raise ValueError("\u7aef\u53e3\u5fc5\u987b\u5728 1 \u5230 65535 \u4e4b\u95f4\u3002")
+        if not (LAN_STREAM_MIN_QUALITY <= quality <= LAN_STREAM_MAX_QUALITY):
+            raise ValueError(
+                f"JPEG \u753b\u8d28\u5fc5\u987b\u5728 {LAN_STREAM_MIN_QUALITY} \u5230 {LAN_STREAM_MAX_QUALITY} \u4e4b\u95f4\u3002"
+            )
+        self.stop_lan_stream()
+        try:
+            server = LANStreamServer(port, quality)
+            server.set_panels(self.windows.values())
+            server.start()
+        except OSError as error:
+            raise RuntimeError(f"\u65e0\u6cd5\u76d1\u542c\u7aef\u53e3 {port}\uff1a{error}") from error
+        self.lan_stream_port = server.port
+        self.lan_stream_quality = quality
+        self.lan_stream_server = server
+        try:
+            save_lan_stream_options(server.port, quality)
+        except OSError:
+            pass
+        self._update_lan_stream_button()
+        return server
+
+    def _lan_stream_status_text(self) -> str:
+        server = self.lan_stream_server
+        if server is None:
+            return "\u5c40\u57df\u7f51\u63a8\u6d41\u672a\u542f\u52a8\u3002"
+        urls = server.urls()
+        return "\u5df2\u542f\u52a8\uff1a\n" + "\n".join(urls)
+
+    def open_lan_stream_dialog(self, parent) -> None:
+        if self.shutting_down:
+            return
+        dialog = tk.Toplevel(parent)
+        dialog.title("\u5c40\u57df\u7f51\u63a8\u6d41")
+        dialog.transient(parent)
+        dialog.resizable(False, False)
+        dialog.grab_set()
+        container = ttk.Frame(dialog, padding=16)
+        container.pack(fill=tk.BOTH, expand=True)
+
+        ttk.Label(
+            container,
+            text="\u65e0\u9700 OBS\uff1a\u542f\u52a8\u540e\uff0c\u5728\u540c\u4e00\u5c40\u57df\u7f51\u7684\u6d4f\u89c8\u5668\u6253\u5f00\u4e0b\u9762\u5730\u5740\u3002",
+        ).pack(anchor=tk.W)
+        form = ttk.Frame(container)
+        form.pack(fill=tk.X, pady=(12, 0))
+        ttk.Label(form, text="\u7aef\u53e3").grid(row=0, column=0, sticky=tk.W)
+        port_var = tk.StringVar(value=str(self.lan_stream_port))
+        ttk.Entry(form, textvariable=port_var, width=10).grid(
+            row=0, column=1, sticky=tk.W, padx=(8, 18)
+        )
+        ttk.Label(form, text="JPEG \u753b\u8d28").grid(row=0, column=2, sticky=tk.W)
+        quality_var = tk.StringVar(value=str(self.lan_stream_quality))
+        ttk.Spinbox(
+            form,
+            from_=LAN_STREAM_MIN_QUALITY,
+            to=LAN_STREAM_MAX_QUALITY,
+            textvariable=quality_var,
+            width=7,
+        ).grid(row=0, column=3, sticky=tk.W, padx=(8, 0))
+        status_var = tk.StringVar(value=self._lan_stream_status_text())
+        status_label = ttk.Label(
+            container, textvariable=status_var, justify=tk.LEFT, wraplength=520
+        )
+        status_label.pack(anchor=tk.W, pady=(12, 0))
+
+        def refresh_status() -> None:
+            status_var.set(self._lan_stream_status_text())
+            self._update_lan_stream_button()
+
+        def start() -> None:
+            try:
+                port = int(port_var.get().strip())
+                quality = int(quality_var.get().strip())
+                server = self.start_lan_stream(port, quality)
+            except (ValueError, RuntimeError) as error:
+                status_var.set(str(error))
+                return
+            port_var.set(str(server.port))
+            refresh_status()
+
+        def stop() -> None:
+            self.stop_lan_stream()
+            refresh_status()
+
+        def close_dialog() -> None:
+            try:
+                dialog.grab_release()
+                dialog.destroy()
+            except tk.TclError:
+                pass
+
+        buttons = ttk.Frame(container)
+        buttons.pack(fill=tk.X, pady=(14, 0))
+        ttk.Button(buttons, text="\u542f\u52a8/\u91cd\u542f", command=start).pack(side=tk.LEFT)
+        ttk.Button(buttons, text="\u505c\u6b62", command=stop).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(buttons, text="\u5173\u95ed", command=close_dialog).pack(side=tk.RIGHT)
+        dialog.protocol("WM_DELETE_WINDOW", close_dialog)
+        dialog.after_idle(lambda: self._center_window(dialog, parent))
 
     @staticmethod
     def _geometry_from_placement(placement: WindowPlacement) -> str:
@@ -1644,6 +2105,7 @@ class CameraManager:
             self.workspace = None
             self.topmost_button = None
             self.borderless_button = None
+            self.lan_stream_button = None
 
         window = tk.Toplevel(self.root)
         self.preview_window = window
@@ -1685,6 +2147,12 @@ class CameraManager:
             text="\u7f51\u7edc",
             command=lambda: self.open_network_camera_dialog(window),
         ).pack(side=tk.RIGHT, padx=(0, 6))
+        self.lan_stream_button = ttk.Button(
+            toolbar,
+            command=lambda: self.open_lan_stream_dialog(window),
+        )
+        self.lan_stream_button.pack(side=tk.RIGHT, padx=(0, 6))
+        self._update_lan_stream_button()
         ttk.Button(toolbar, text="\u626b\u63cf", command=self.scan_for_cameras).pack(
             side=tk.RIGHT, padx=(0, 6)
         )
@@ -2432,6 +2900,7 @@ class CameraManager:
         self.hide_launcher()
         self._show_preview_window()
         self._schedule_borderless_fit()
+        self._refresh_lan_stream_panels()
         return True
 
     def _apply_capture_performance_profile(self) -> None:
@@ -2533,6 +3002,11 @@ class CameraManager:
             text="\u67e5\u627e\u7f51\u7edc\u6444\u50cf\u5934",
             command=lambda: self.open_network_camera_dialog(launcher),
         ).pack(fill=tk.X, pady=(8, 0))
+        ttk.Button(
+            container,
+            text="\u5c40\u57df\u7f51\u63a8\u6d41",
+            command=lambda: self.open_lan_stream_dialog(launcher),
+        ).pack(fill=tk.X, pady=(8, 0))
         ttk.Button(container, text="\u9000\u51fa", command=self.close_all).pack(
             fill=tk.X, pady=(8, 0)
         )
@@ -2545,7 +3019,7 @@ class CameraManager:
             justify=tk.LEFT,
             wraplength=324,
         ).pack(fill=tk.X, pady=(12, 0))
-        launcher.geometry("360x230")
+        launcher.geometry("360x278")
         launcher.deiconify()
         launcher.lift()
         launcher.focus_force()
@@ -3134,6 +3608,7 @@ class CameraManager:
     def camera_closed(self, panel: CameraPanel) -> None:
         if self.windows.get(panel.camera_index) is panel:
             del self.windows[panel.camera_index]
+        self._refresh_lan_stream_panels()
         self._windowed_panel_placements.pop(panel.camera_index, None)
         if self.active_panel is panel:
             self.active_panel = next(iter(self.windows.values()), None)
@@ -3170,6 +3645,7 @@ class CameraManager:
         self._local_scan_running = False
         self._borderless_fit_after_id = None
         self._stop_hotkey_listener()
+        self.stop_lan_stream()
         for cleanup_dialog in tuple(self._network_dialog_cleanups):
             cleanup_dialog()
         if self.launcher_window is not None:
@@ -3251,6 +3727,7 @@ def main() -> int:
         raise ValueError("max-index must be zero or greater.")
     if args.list:
         return list_cameras(args.max_index, args.width, args.height, args.fps)
+
     if not args.self_test and not acquire_single_instance():
         hotkey = load_hotkey()
         raise RuntimeError(
