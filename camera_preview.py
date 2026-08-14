@@ -20,7 +20,10 @@ import time
 import tkinter as tk
 import uuid
 import xml.etree.ElementTree as ET
-from ctypes import wintypes
+if sys.platform == "win32":
+    from ctypes import wintypes
+else:
+    wintypes = None
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from http import HTTPStatus
@@ -44,10 +47,16 @@ from PIL import Image, ImageTk
 
 
 WINDOW_TITLE = "\u6444\u50cf\u5934\u9884\u89c8"
-BACKENDS = (
-    ("DirectShow", cv2.CAP_DSHOW),
-    ("Media Foundation", cv2.CAP_MSMF),
-)
+if sys.platform == "win32":
+    BACKENDS = (
+        ("DirectShow", cv2.CAP_DSHOW),
+        ("Media Foundation", cv2.CAP_MSMF),
+    )
+else:
+    BACKENDS = (
+        ("V4L2", getattr(cv2, "CAP_V4L2", cv2.CAP_ANY)),
+        ("OpenCV", cv2.CAP_ANY),
+    )
 MAX_ZOOM = 8.0
 DISPLAY_INTERVAL_MS = 50
 DEFAULT_CAPTURE_FOURCC = "MJPG"

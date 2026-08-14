@@ -1,10 +1,11 @@
 # Camera Preview
 
-A lightweight Windows desktop application for viewing UVC and ONVIF camera feeds.
+A lightweight Windows and Ubuntu desktop application for viewing UVC and ONVIF
+camera feeds.
 
 ## Features
 
-- Simultaneous previews for all connected Windows UVC cameras in one shared window
+- Simultaneous previews for connected UVC cameras in one shared window
 - Two local USB cameras automatically use uncompressed `YUY2` at `640x480 @ 30 FPS` for smooth dual preview
 - Drag each camera panel by its top bar to arrange feeds anywhere in the workspace
 - Restores the main window location and each camera panel location after reopening
@@ -21,20 +22,20 @@ A lightweight Windows desktop application for viewing UVC and ONVIF camera feeds
 
 ## Requirements
 
-- Windows 10 or newer
+- Windows 10 or newer, or Ubuntu 22.04/24.04 x86_64
 - Python 3.10 or newer
 - A UVC-compatible USB camera or an ONVIF/RTSP network camera
 
 ## Run From Source
 
-```powershell
+```text
 python -m pip install -r requirements.txt
 python camera_preview.py
 ```
 
 Use `--list` to find usable camera indexes:
 
-```powershell
+```text
 python camera_preview.py --list
 ```
 
@@ -111,6 +112,36 @@ python camera_preview.py --camera 0 --camera 1
 
 Screenshots are saved in a `screenshots` folder beside the running application.
 
+## Ubuntu Portable Build
+
+Download `CameraPreview-ubuntu-x86_64.tar.gz` from the latest GitHub Release,
+then extract and run it:
+
+```bash
+tar -xzf CameraPreview-ubuntu-x86_64.tar.gz
+cd CameraPreview
+./CameraPreview
+```
+
+The packaged build targets Ubuntu 22.04 and newer on x86_64 PCs. If Ubuntu
+reports a missing shared library, install the runtime dependencies:
+
+```bash
+sudo apt update
+sudo apt install libgl1 libglib2.0-0 libsm6 libxext6 libxrender1
+```
+
+For a local USB camera, make sure the account can access `/dev/video*`:
+
+```bash
+sudo usermod -aG video "$USER"
+```
+
+Log out and back in after changing the `video` group. The global Ctrl+key
+hide/show hotkey and Windows single-instance protection are Windows-only;
+preview, USB/ONVIF camera access, LAN streaming, password protection, and
+portable settings work on Ubuntu.
+
 ## Build A Windows EXE
 
 ```powershell
@@ -121,13 +152,24 @@ pyinstaller --noconfirm --clean CameraPreview.spec
 The portable build is placed in `dist/CameraPreview/`. Keep `CameraPreview.exe`
 and its `_internal` folder together when moving the application.
 
+## Build On Ubuntu
+
+```bash
+sudo apt update
+sudo apt install python3-tk libgl1 libglib2.0-0 libsm6 libxext6 libxrender1
+python3 -m pip install --user -r requirements.txt pyinstaller
+python3 -m PyInstaller --noconfirm --clean CameraPreview.spec
+```
+
+The Linux binary is `dist/CameraPreview/CameraPreview`.
+
 ## Portable Data
 
 The application never stores its own persistent data in `AppData`, `LocalAppData`,
-or `Roaming`. `camera_preview_settings.json` is created beside
-`CameraPreview.exe` and holds the hotkey, window location, panel layout, and display
-mode, plus LAN-stream port and quality settings. Screenshots are saved to the
-`screenshots` folder beside the executable.
+or `Roaming`. `camera_preview_settings.json` is created beside the executable and
+holds the hotkey, window location, panel layout, and display mode, plus LAN-stream
+port and quality settings. Screenshots are saved to the `screenshots` folder beside
+the executable.
 
 ## License
 
