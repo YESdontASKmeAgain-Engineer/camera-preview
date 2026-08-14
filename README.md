@@ -114,8 +114,13 @@ Screenshots are saved in a `screenshots` folder beside the running application.
 
 ## Ubuntu Portable Build
 
-Download `CameraPreview-ubuntu-x86_64.tar.gz` from the latest GitHub Release,
-then extract and run it:
+Download the matching package from the latest GitHub Release:
+
+- `CameraPreview-ubuntu-x86_64.tar.gz` for Intel/AMD PCs
+- `CameraPreview-ubuntu-arm64.tar.gz` for ARM64 devices such as Orange Pi and
+  Raspberry Pi running 64-bit Ubuntu
+
+Then extract and run it:
 
 ```bash
 tar -xzf CameraPreview-ubuntu-x86_64.tar.gz
@@ -123,8 +128,8 @@ cd CameraPreview
 ./CameraPreview
 ```
 
-The packaged build targets Ubuntu 22.04 and newer on x86_64 PCs. If Ubuntu
-reports a missing shared library, install the runtime dependencies:
+The packaged builds target Ubuntu 22.04 and newer. If Ubuntu reports a missing
+shared library, install the runtime dependencies:
 
 ```bash
 sudo apt update
