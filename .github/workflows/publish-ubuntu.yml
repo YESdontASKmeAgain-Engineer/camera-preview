@@ -1,0 +1,74 @@
+name: Publish Ubuntu Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to create or update
+        required: true
+        default: v1.1.0
+        type: string
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-ubuntu:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install Ubuntu dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-tk libgl1 libglib2.0-0 libsm6 libxext6 libxrender1
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt pyinstaller
+
+      - name: Verify Ubuntu code path
+        run: |
+          python -m py_compile camera_preview.py
+          python -c 'import camera_preview as app; assert app.BACKENDS[0][0] == "V4L2"; assert app.wintypes is None'
+
+      - name: Build portable application
+        run: |
+          python -m PyInstaller --noconfirm --clean CameraPreview.spec
+          dist/CameraPreview/CameraPreview --help >/dev/null
+          cp README.md LICENSE dist/CameraPreview/
+          tar -C dist -czf CameraPreview-ubuntu-x86_64.tar.gz CameraPreview
+          sha256sum CameraPreview-ubuntu-x86_64.tar.gz > CameraPreview-ubuntu-x86_64.tar.gz.sha256
+
+      - name: Store build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: CameraPreview-ubuntu-x86_64
+          path: |
+            CameraPreview-ubuntu-x86_64.tar.gz
+            CameraPreview-ubuntu-x86_64.tar.gz.sha256
+          if-no-files-found: error
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          gh release view "$RELEASE_TAG" >/dev/null 2>&1 || \
+            gh release create "$RELEASE_TAG" --target "$GITHUB_SHA" \
+              --title "Camera Preview $RELEASE_TAG" --generate-notes
+          gh release upload "$RELEASE_TAG" \
+            CameraPreview-ubuntu-x86_64.tar.gz \
+            CameraPreview-ubuntu-x86_64.tar.gz.sha256 \
+            --clobber
