@@ -1,0 +1,2 @@
+# Install this optional layer in the WSL YOLO environment.
+ultralytics>=8.3.0

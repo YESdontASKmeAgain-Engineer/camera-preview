@@ -53,6 +53,45 @@ address automatically. A known RTSP address can also be pasted directly and open
 Add Preview. When no USB camera is available, the application opens a small
 launcher with the same network-search action.
 
+## Optional YOLO Detection (WSL)
+
+The source project overlays person-only YOLO detections on the desktop preview,
+screenshots, and LAN MJPEG streams. Detection runs in one background worker and
+keeps only the newest frame, so a slow inference device does not create an unbounded
+video delay. The COCO `person` class (ID `0`) is the only class enabled by default.
+
+The existing WSL deployment already contains the model and Python environment. From
+Ubuntu, with `USB Camera3` attached to WSL, run:
+
+```bash
+cd /mnt/c/Users/YunDrone/CameraPreview
+./run-wsl-camera-preview-yolo.sh
+```
+
+The equivalent command, with explicit options, is:
+
+```bash
+/home/yundrone/yolo/.venv/bin/python camera_preview.py \
+  --camera 0 --width 640 --height 480 --fps 30 \
+  --yolo --yolo-model /home/yundrone/yolo/models/yolo11n.pt \
+  --start-lan-stream
+```
+
+On Windows, double-click
+`C:\Users\YunDrone\yolo-realtime\start_camera_preview_yolo.bat`. It attaches
+`USB Camera3`, starts the original Camera Preview with YOLO enabled, and opens the
+LAN preview at `http://localhost:8080/`.
+
+If the camera was previously released to Windows, Windows may show one UAC prompt
+while the script attaches it back to WSL. To stop the integrated service and release
+the camera to Windows, double-click
+`C:\Users\YunDrone\yolo-realtime\stop_camera_yolo.bat`.
+
+YOLO is opt-in: running `python camera_preview.py` without `--yolo` keeps the
+original camera-only behavior. The optional Python package is listed in
+`requirements-yolo.txt`; the CUDA-enabled WSL environment can continue to use the
+already installed Ultralytics/PyTorch stack.
+
 ## Built-In LAN Streaming
 
 Click `局域网推流` in the toolbar, leave the default port at `8080`, and click

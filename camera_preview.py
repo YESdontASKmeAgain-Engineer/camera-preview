@@ -44,6 +44,7 @@ from xml.sax.saxutils import escape as xml_escape
 
 import cv2
 from PIL import Image, ImageTk
+from yolo_pipeline import YoloConfig, YoloPipeline, default_model_path
 
 
 WINDOW_TITLE = "\u6444\u50cf\u5934\u9884\u89c8"
@@ -59,6 +60,7 @@ else:
     )
 MAX_ZOOM = 8.0
 DISPLAY_INTERVAL_MS = 50
+XRDP_DISPLAY_INTERVAL_MS = 1000
 DEFAULT_CAPTURE_FOURCC = "MJPG"
 MULTI_CAMERA_WIDTH = 640
 MULTI_CAMERA_HEIGHT = 480
@@ -82,6 +84,10 @@ LAN_STREAM_FPS = 30.0
 LAN_STREAM_AUTH_USERNAME = "camera"
 LAN_STREAM_PASSWORD_ITERATIONS = 200_000
 LAN_STREAM_PASSWORD_SALT_BYTES = 16
+LAN_ADDRESS_PROBE_TARGETS = (
+    ("1.1.1.1", 80),
+    ("8.8.8.8", 80),
+)
 WM_HOTKEY = 0x0312
 WM_QUIT = 0x0012
 HOTKEY_ID = 0xCA01
@@ -1309,6 +1315,48 @@ def lan_camera_id(camera_index: int | str) -> str:
     return f"{readable[:40]}-{digest}"
 
 
+def discover_lan_ipv4_addresses() -> list[str]:
+    """Return usable IPv4 addresses, with the default-route address first."""
+    addresses: list[str] = []
+    seen: set[str] = set()
+
+    def add(address: str) -> None:
+        try:
+            parsed = ipaddress.ip_address(address)
+        except ValueError:
+            return
+        if (
+            parsed.version != 4
+            or parsed.is_loopback
+            or parsed.is_unspecified
+            or parsed.is_multicast
+        ):
+            return
+        normalized = str(parsed)
+        if normalized not in seen:
+            seen.add(normalized)
+            addresses.append(normalized)
+
+    # A UDP connect selects a route without sending any packets. This works even
+    # when Linux maps its hostname only to 127.0.1.1 in /etc/hosts.
+    for target in LAN_ADDRESS_PROBE_TARGETS:
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as route_socket:
+                route_socket.connect(target)
+                add(route_socket.getsockname()[0])
+        except OSError:
+            continue
+
+    try:
+        host_name = socket.gethostname()
+        for address in socket.gethostbyname_ex(host_name)[2]:
+            add(address)
+    except OSError:
+        pass
+
+    return addresses or ["127.0.0.1"]
+
+
 def _parse_basic_authorization(value: str | None) -> tuple[str, str] | None:
     if not value:
         return None
@@ -1636,21 +1684,10 @@ class LANStreamServer:
         )
 
     def urls(self) -> list[str]:
-        addresses: set[str] = set()
-        try:
-            host_name = socket.gethostname()
-            for address in socket.gethostbyname_ex(host_name)[2]:
-                try:
-                    parsed = ipaddress.ip_address(address)
-                except ValueError:
-                    continue
-                if parsed.version == 4 and not parsed.is_loopback:
-                    addresses.add(address)
-        except OSError:
-            pass
-        if not addresses:
-            addresses.add("127.0.0.1")
-        return [f"http://{address}:{self.port}/" for address in sorted(addresses)]
+        return [
+            f"http://{address}:{self.port}/"
+            for address in discover_lan_ipv4_addresses()
+        ]
 
     def stream_urls(self) -> list[tuple[str, str]]:
         """Return named direct MJPEG URLs for other applications to pull."""
@@ -1703,6 +1740,8 @@ class CameraPanel:
         self.frame_lock = threading.Lock()
         self.latest_frame = None
         self.frame_sequence = 0
+        self._last_drawn_frame_sequence = 0
+        self._last_drawn_yolo_sequence = 0
         self.frame_count = 0
         self.fps = 0.0
         self.fps_start = time.perf_counter()
@@ -1714,6 +1753,7 @@ class CameraPanel:
         self._drag_offset: tuple[int, int] | None = None
         self._draw_after_id: str | None = None
         self.chrome_visible = True
+        self.yolo_label = None
 
         placement = self._initial_placement(position, saved_placement)
         self.panel = tk.Frame(
@@ -1765,6 +1805,8 @@ class CameraPanel:
         )
 
     def _display_interval_ms(self) -> int:
+        if os.environ.get("XRDP_SESSION") == "1":
+            return XRDP_DISPLAY_INTERVAL_MS
         if len(self.manager.windows) > 1:
             return MULTI_CAMERA_DISPLAY_INTERVAL_MS
         return DISPLAY_INTERVAL_MS
@@ -1805,6 +1847,14 @@ class CameraPanel:
             text="0.0 FPS",
         )
         self.fps_label.pack(side=tk.LEFT, padx=(12, 0))
+        if self.manager.yolo_pipeline is not None:
+            self.yolo_label = tk.Label(
+                header,
+                background="#252d38",
+                foreground="#86efac",
+                text="YOLO loading",
+            )
+            self.yolo_label.pack(side=tk.LEFT, padx=(12, 0))
 
         ttk.Button(header, text="X", width=3, command=self.close).pack(
             side=tk.RIGHT, padx=(0, 5), pady=3
@@ -1833,7 +1883,10 @@ class CameraPanel:
             text="Opening camera...",
         )
 
-        for widget in (header, name_label, self.zoom_label, self.fps_label):
+        drag_widgets = [header, name_label, self.zoom_label, self.fps_label]
+        if self.yolo_label is not None:
+            drag_widgets.append(self.yolo_label)
+        for widget in drag_widgets:
             self._bind_drag_handle(widget)
         self.panel.bind("<ButtonPress-1>", self._activate_panel, add="+")
         self.panel.bind(
@@ -1944,21 +1997,52 @@ class CameraPanel:
                 self.latest_frame = frame
                 self.frame_count += 1
                 self.frame_sequence += 1
+                sequence = self.frame_sequence
+            if self.manager.yolo_pipeline is not None:
+                self.manager.yolo_pipeline.submit(
+                    self.camera_index,
+                    sequence,
+                    frame.copy(),
+                )
             self.manager.notify_frame_available()
             if read_elapsed < self.frame_interval:
                 time.sleep(self.frame_interval - read_elapsed)
 
     def _take_latest_frame(self):
-        with self.frame_lock:
-            if self.latest_frame is None:
-                return None
-            return self.latest_frame.copy()
+        frame, _ = self._take_latest_frame_with_id()
+        return frame
 
-    def _take_latest_frame_with_id(self):
+    def _take_raw_frame_with_id(self):
         with self.frame_lock:
             if self.latest_frame is None:
                 return None, 0
             return self.latest_frame.copy(), self.frame_sequence
+
+    def _take_latest_frame_with_id(self):
+        pipeline = self.manager.yolo_pipeline
+        if pipeline is not None:
+            annotated = pipeline.latest(self.camera_index)
+            if annotated is not None:
+                sequence, frame = annotated
+                return frame, sequence
+        return self._take_raw_frame_with_id()
+
+    def _take_next_display_frame(self):
+        pipeline = self.manager.yolo_pipeline
+        if pipeline is not None:
+            annotated = pipeline.latest(self.camera_index)
+            if annotated is not None:
+                sequence, frame = annotated
+                if sequence > self._last_drawn_yolo_sequence:
+                    self._last_drawn_yolo_sequence = sequence
+                    return frame, sequence
+                if pipeline.stats().error is None:
+                    return None, self._last_drawn_frame_sequence
+
+        frame, sequence = self._take_raw_frame_with_id()
+        if frame is None or sequence <= self._last_drawn_frame_sequence:
+            return None, self._last_drawn_frame_sequence
+        return frame, sequence
 
     def _latest_frame_sequence(self) -> int:
         with self.frame_lock:
@@ -2010,14 +2094,30 @@ class CameraPanel:
             # Reusing the Tk image prevents allocation churn for every frame.
             self.image_photo.paste(image)
 
+    def _update_yolo_label(self) -> None:
+        if self.yolo_label is None:
+            return
+        stats = self.manager.yolo_pipeline.stats()
+        if stats.error:
+            text = "YOLO error"
+            color = "#fca5a5"
+        elif not stats.ready:
+            text = "YOLO loading"
+            color = "#fde68a"
+        else:
+            text = f"YOLO {stats.fps:.1f} FPS"
+            color = "#86efac"
+        self.yolo_label.configure(text=text, foreground=color)
+
     def _draw_frame(self) -> None:
         self._draw_after_id = None
         if not self.running:
             return
 
         self._update_fps()
-        frame = self._take_latest_frame()
+        frame, frame_sequence = self._take_next_display_frame()
         if frame is not None:
+            self._last_drawn_frame_sequence = frame_sequence
             source_height, source_width = frame.shape[:2]
             source_size = (source_width, source_height)
             if source_size != self.source_size:
@@ -2033,6 +2133,8 @@ class CameraPanel:
             self.fps_label.configure(text=f"{self.fps:.1f} FPS")
             if time.perf_counter() > self.status_until:
                 self.status_text = ""
+
+        self._update_yolo_label()
 
         self.canvas.itemconfigure(self.message_id, text=self.status_text)
         try:
@@ -2058,7 +2160,7 @@ class CameraPanel:
         self.zoom_view.reset()
 
     def save_screenshot(self) -> None:
-        frame = self._take_latest_frame()
+        frame, _ = self._take_latest_frame_with_id()
         if frame is None:
             self.status_text = "No camera frame is available yet."
         else:
@@ -2080,6 +2182,8 @@ class CameraPanel:
         if not self.running:
             return
         self.running = False
+        if self.manager.yolo_pipeline is not None:
+            self.manager.yolo_pipeline.remove(self.camera_index)
         if self._draw_after_id is not None:
             try:
                 self.window.after_cancel(self._draw_after_id)
@@ -2110,6 +2214,7 @@ class CameraManager:
         max_index: int,
         capture_fourcc: str = DEFAULT_CAPTURE_FOURCC,
         available_local_indices: Iterable[int] | None = None,
+        yolo_config: YoloConfig | None = None,
     ) -> None:
         self.width = width
         self.height = height
@@ -2129,6 +2234,7 @@ class CameraManager:
         self.root = tk.Tk()
         self.root.withdraw()
         self.root.protocol("WM_DELETE_WINDOW", self.close_all)
+        self.yolo_pipeline = YoloPipeline(yolo_config) if yolo_config is not None else None
         self.windows: dict[int | str, CameraPanel] = {}
         self.panel_placements = load_panel_placements()
         self.main_window_placement = load_main_window_placement()
@@ -4069,6 +4175,9 @@ class CameraManager:
             window.close(notify_manager=False)
         self.windows.clear()
         self.active_panel = None
+        if self.yolo_pipeline is not None:
+            self.yolo_pipeline.close()
+            self.yolo_pipeline = None
         if self.preview_window is not None:
             try:
                 self.preview_window.destroy()
@@ -4094,6 +4203,8 @@ def show_previews(
     max_index: int,
     capture_fourcc: str = DEFAULT_CAPTURE_FOURCC,
     available_local_indices: Iterable[int] | None = None,
+    auto_start_lan_stream: bool = False,
+    yolo_config: YoloConfig | None = None,
 ) -> int:
     manager = CameraManager(
         captures,
@@ -4103,7 +4214,13 @@ def show_previews(
         max_index,
         capture_fourcc,
         available_local_indices,
+        yolo_config,
     )
+    if auto_start_lan_stream:
+        manager.start_lan_stream(
+            manager.lan_stream_port,
+            manager.lan_stream_quality,
+        )
     manager.run()
     return 0
 
@@ -4117,6 +4234,12 @@ def parse_args() -> argparse.Namespace:
         help="Camera index to open. Repeat the option to select multiple cameras.",
     )
     parser.add_argument(
+        "--network-url",
+        action="append",
+        default=None,
+        help="HTTP/RTSP camera URL to open. Repeat for multiple network streams.",
+    )
+    parser.add_argument(
         "--all",
         action="store_true",
         help="Skip startup selection and open every usable camera up to --max-index.",
@@ -4127,6 +4250,38 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--list", action="store_true", help="List working camera indices and exit.")
     parser.add_argument("--max-index", type=int, default=8, help="Highest camera index scanned.")
     parser.add_argument("--self-test", action="store_true", help="Open selected cameras and exit.")
+    parser.add_argument(
+        "--start-lan-stream",
+        action="store_true",
+        help="Start LAN streaming immediately using the saved port and password.",
+    )
+    parser.add_argument(
+        "--yolo",
+        action="store_true",
+        help="Overlay person-only YOLO detections on every camera preview.",
+    )
+    parser.add_argument(
+        "--yolo-model",
+        default=None,
+        help="YOLO weights path (defaults to the WSL yolo11n model).",
+    )
+    parser.add_argument(
+        "--yolo-conf",
+        type=float,
+        default=0.35,
+        help="YOLO confidence threshold (0-1).",
+    )
+    parser.add_argument(
+        "--yolo-imgsz",
+        type=int,
+        default=640,
+        help="YOLO inference image size.",
+    )
+    parser.add_argument(
+        "--yolo-device",
+        default=None,
+        help="YOLO device, for example 0, cuda:0, or cpu.",
+    )
     return parser.parse_args()
 
 
@@ -4136,8 +4291,24 @@ def main() -> int:
         raise ValueError("Width, height, and fps must be positive.")
     if args.max_index < 0:
         raise ValueError("max-index must be zero or greater.")
+    yolo_config = None
+    if args.yolo:
+        model_path = (
+            Path(args.yolo_model).expanduser()
+            if args.yolo_model
+            else default_model_path()
+        )
+        yolo_config = YoloConfig(
+            model_path=model_path,
+            confidence=args.yolo_conf,
+            image_size=args.yolo_imgsz,
+            device=args.yolo_device,
+        )
     if args.list:
         return list_cameras(args.max_index, args.width, args.height, args.fps)
+
+    if args.network_url and (args.camera or args.all):
+        raise ValueError("Use --network-url separately from local camera options.")
 
     if not args.self_test and not acquire_single_instance():
         hotkey = load_hotkey()
@@ -4145,6 +4316,38 @@ def main() -> int:
             f"{WINDOW_TITLE}\u5df2\u7ecf\u5728\u8fd0\u884c\u3002"
             f"\u6309 {hotkey.label} \u663e\u793a\u6216\u9690\u85cf\u7a97\u53e3\u3002"
         )
+
+    if args.network_url:
+        captures: list[OpenedCapture] = []
+        try:
+            for stream_url in args.network_url:
+                captures.append(open_network_capture(stream_url))
+            if not captures:
+                raise RuntimeError("No network camera stream was opened.")
+            for opened in captures:
+                actual_width = int(opened.capture.get(cv2.CAP_PROP_FRAME_WIDTH))
+                actual_height = int(opened.capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                print(
+                    f"Camera {opened.index}: {actual_width}x{actual_height} "
+                    f"via {opened.backend}"
+                )
+            if args.self_test:
+                print("Camera self-test passed.")
+                return 0
+            return show_previews(
+                captures,
+                width=args.width,
+                height=args.height,
+                fps=args.fps,
+                max_index=args.max_index,
+                capture_fourcc=DEFAULT_CAPTURE_FOURCC,
+                available_local_indices=(),
+                auto_start_lan_stream=args.start_lan_stream,
+                yolo_config=yolo_config,
+            )
+        finally:
+            for opened in captures:
+                opened.capture.release()
 
     scan_all = args.all or not args.camera
     auto_select = not args.camera and not args.all and not args.self_test
@@ -4180,6 +4383,8 @@ def main() -> int:
                 args.max_index,
                 capture_fourcc,
                 available_local_indices,
+                args.start_lan_stream,
+                yolo_config,
             )
 
         if auto_select and len(captures) > 1:
@@ -4241,6 +4446,8 @@ def main() -> int:
             args.max_index,
             capture_fourcc,
             available_local_indices,
+            args.start_lan_stream,
+            yolo_config,
         )
     finally:
         for opened in captures:
