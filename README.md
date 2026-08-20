@@ -92,6 +92,32 @@ original camera-only behavior. The optional Python package is listed in
 `requirements-yolo.txt`; the CUDA-enabled WSL environment can continue to use the
 already installed Ultralytics/PyTorch stack.
 
+### Direct Windows Controls
+
+When launched with `start_camera_preview_direct.bat`, the Windows preview toolbar
+controls the local WSL service directly:
+
+- `YOLO 开` / `YOLO 关` toggles the person-only overlay without disconnecting the camera.
+- `采集样本` starts saving one raw, unannotated JPEG per second. Click `停止采集`
+  when the recording session is complete.
+- `目标自动截图` saves one annotated screenshot whenever identity label `1` appears.
+  It rearms after the target has been absent for one second, so a person staying in
+  frame does not create a continuous burst of duplicate screenshots.
+
+Raw images are saved locally in
+`training_samples/target_person/images/raw/`. This directory is ignored by Git so
+training data is not uploaded with the source code. Use the raw images for labeling;
+do not use the preview screenshots with YOLO boxes baked in.
+
+Target screenshots are saved in the portable application's `screenshots/` directory.
+
+The direct Windows launcher also enables an optional YOLO11 pose-quality gate. It
+uses `models/yolo11n-pose.pt` to require at least six visible body keypoints before
+the identity label `1` is drawn. Pose is only a quality filter; the identity
+classifier remains responsible for deciding who the person is. To use the original
+identity-only pipeline, remove the `--pose-model` and related `--pose-*` arguments
+from `start_camera_preview_direct.ps1`.
+
 ## Built-In LAN Streaming
 
 Click `局域网推流` in the toolbar, leave the default port at `8080`, and click

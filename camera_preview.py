@@ -48,6 +48,24 @@ from yolo_pipeline import YoloConfig, YoloPipeline, default_model_path
 
 
 WINDOW_TITLE = "\u6444\u50cf\u5934\u9884\u89c8"
+UI_BACKGROUND = "#111317"
+UI_TOPBAR = "#181b20"
+UI_SURFACE = "#20242a"
+UI_SURFACE_HOVER = "#2a3038"
+UI_SURFACE_PRESSED = "#15181c"
+UI_WORKSPACE = "#0c0e11"
+UI_CANVAS = "#050607"
+UI_BORDER = "#343a43"
+UI_BORDER_ACTIVE = "#3d8ee8"
+UI_TEXT = "#f2f4f7"
+UI_TEXT_MUTED = "#a6afb9"
+UI_TEXT_DISABLED = "#68717c"
+UI_ACCENT = "#2778d4"
+UI_ACCENT_HOVER = "#3288e8"
+UI_SUCCESS = "#34b978"
+UI_WARNING = "#e7a43a"
+UI_DANGER = "#e45b5b"
+UI_RECORDING = "#c94f55"
 if sys.platform == "win32":
     BACKENDS = (
         ("DirectShow", cv2.CAP_DSHOW),
@@ -69,6 +87,8 @@ MULTI_CAMERA_FOURCC = "YUY2"
 MULTI_CAMERA_DISPLAY_INTERVAL_MS = 33
 DEFAULT_MAIN_WINDOW_WIDTH = 1280
 DEFAULT_MAIN_WINDOW_HEIGHT = 800
+MIN_MAIN_WINDOW_WIDTH = 900
+MIN_MAIN_WINDOW_HEIGHT = 560
 DEFAULT_PANEL_WIDTH = 600
 DEFAULT_PANEL_HEIGHT = 420
 PANEL_PLACEMENTS_KEY = "panel_positions"
@@ -81,6 +101,7 @@ LAN_STREAM_DEFAULT_QUALITY = 80
 LAN_STREAM_MIN_QUALITY = 20
 LAN_STREAM_MAX_QUALITY = 100
 LAN_STREAM_FPS = 30.0
+PERSON_STREAM_STATUS_INTERVAL_SECONDS = 2.0
 LAN_STREAM_AUTH_USERNAME = "camera"
 LAN_STREAM_PASSWORD_ITERATIONS = 200_000
 LAN_STREAM_PASSWORD_SALT_BYTES = 16
@@ -104,6 +125,205 @@ TK_ALT_MASK = 0x0008
 ERROR_ALREADY_EXISTS = 183
 SINGLE_INSTANCE_MUTEX_NAME = r"Local\CameraPreview-7F0D4E7E-9A77-4D08-9807-9B0F8B8E33E1"
 _single_instance_mutex = None
+
+
+def configure_ui_style(root: tk.Misc) -> None:
+    """Apply one restrained dark theme to the workspace and dialogs."""
+    root.configure(background=UI_BACKGROUND)
+    # Tk option-database values are Tcl lists; brace the family name so the
+    # space in "Segoe UI" is not parsed as a separate font argument.
+    root.option_add("*Font", "{Segoe UI} 10")
+    root.option_add("*Menu.background", UI_SURFACE)
+    root.option_add("*Menu.foreground", UI_TEXT)
+    root.option_add("*Menu.activeBackground", UI_ACCENT)
+    root.option_add("*Menu.activeForeground", "#ffffff")
+    root.option_add("*Menu.relief", "flat")
+    root.option_add("*Listbox.background", UI_SURFACE)
+    root.option_add("*Listbox.foreground", UI_TEXT)
+    root.option_add("*Listbox.selectBackground", UI_ACCENT)
+    root.option_add("*Listbox.selectForeground", "#ffffff")
+
+    style = ttk.Style(root)
+    if "clam" in style.theme_names():
+        style.theme_use("clam")
+
+    style.configure(".", font=("Segoe UI", 10))
+    style.configure("TFrame", background=UI_BACKGROUND)
+    style.configure("Topbar.TFrame", background=UI_TOPBAR)
+    style.configure("Toolbar.TFrame", background=UI_TOPBAR)
+    style.configure("TLabel", background=UI_BACKGROUND, foreground=UI_TEXT)
+    style.configure(
+        "Title.TLabel",
+        background=UI_TOPBAR,
+        foreground=UI_TEXT,
+        font=("Segoe UI Semibold", 12),
+    )
+    style.configure(
+        "Subtitle.TLabel",
+        background=UI_TOPBAR,
+        foreground=UI_TEXT_MUTED,
+        font=("Segoe UI", 9),
+    )
+    style.configure(
+        "Group.TLabel",
+        background=UI_TOPBAR,
+        foreground=UI_TEXT_MUTED,
+        font=("Segoe UI Semibold", 9),
+    )
+    style.configure(
+        "Service.TLabel",
+        background=UI_TOPBAR,
+        foreground=UI_TEXT_MUTED,
+        font=("Segoe UI Semibold", 9),
+        padding=(8, 3),
+    )
+    style.configure("ServiceReady.TLabel", foreground=UI_SUCCESS)
+    style.configure("ServiceBusy.TLabel", foreground=UI_WARNING)
+    style.configure("ServiceError.TLabel", foreground=UI_DANGER)
+
+    button_options = {
+        "background": UI_SURFACE,
+        "foreground": UI_TEXT,
+        "bordercolor": UI_BORDER,
+        "lightcolor": UI_SURFACE,
+        "darkcolor": UI_SURFACE,
+        "relief": "flat",
+        "padding": (10, 6),
+    }
+    style.configure("TButton", **button_options)
+    style.configure("Toolbar.TButton", **button_options)
+    style.configure("Panel.TButton", **{**button_options, "padding": (8, 3)})
+    style.configure(
+        "Primary.TButton",
+        **{
+            **button_options,
+            "background": UI_ACCENT,
+            "bordercolor": UI_ACCENT,
+        },
+    )
+    for style_name in ("TButton", "Toolbar.TButton", "Panel.TButton"):
+        style.map(
+            style_name,
+            background=[
+                ("pressed", UI_SURFACE_PRESSED),
+                ("active", UI_SURFACE_HOVER),
+                ("disabled", UI_TOPBAR),
+            ],
+            foreground=[("disabled", UI_TEXT_DISABLED)],
+            bordercolor=[("active", "#46505c"), ("disabled", UI_TOPBAR)],
+        )
+    style.map(
+        "Primary.TButton",
+        background=[
+            ("pressed", "#1f66b5"),
+            ("active", UI_ACCENT_HOVER),
+            ("disabled", "#264667"),
+        ],
+        foreground=[("disabled", "#91a8bf")],
+        bordercolor=[("active", UI_ACCENT_HOVER), ("disabled", "#264667")],
+    )
+
+    toggle_options = {
+        "background": UI_TOPBAR,
+        "foreground": UI_TEXT,
+        "padding": (7, 5),
+        "indicatorcolor": UI_SURFACE,
+        "indicatorrelief": "flat",
+    }
+    style.configure("Toggle.TCheckbutton", **toggle_options)
+    style.configure("Yolo.Toggle.TCheckbutton", **toggle_options)
+    style.configure("Capture.Toggle.TCheckbutton", **toggle_options)
+    style.configure("Recording.Toggle.TCheckbutton", **toggle_options)
+    for style_name, selected_color in (
+        ("Toggle.TCheckbutton", UI_ACCENT),
+        ("Yolo.Toggle.TCheckbutton", UI_ACCENT),
+        ("Capture.Toggle.TCheckbutton", UI_SUCCESS),
+        ("Recording.Toggle.TCheckbutton", UI_RECORDING),
+    ):
+        style.map(
+            style_name,
+            background=[("active", UI_SURFACE_HOVER), ("disabled", UI_TOPBAR)],
+            foreground=[("disabled", UI_TEXT_DISABLED)],
+            indicatorcolor=[
+                ("selected", selected_color),
+                ("disabled", "#353a41"),
+                ("!selected", UI_SURFACE),
+            ],
+        )
+
+    style.configure("Toolbar.TSeparator", background=UI_BORDER)
+    style.configure(
+        "TCheckbutton",
+        background=UI_BACKGROUND,
+        foreground=UI_TEXT,
+        indicatorcolor=UI_SURFACE,
+    )
+    style.map(
+        "TCheckbutton",
+        background=[("active", UI_BACKGROUND)],
+        foreground=[("disabled", UI_TEXT_DISABLED)],
+        indicatorcolor=[("selected", UI_ACCENT), ("disabled", "#353a41")],
+    )
+    style.configure(
+        "TEntry",
+        fieldbackground=UI_SURFACE,
+        foreground=UI_TEXT,
+        insertcolor=UI_TEXT,
+        bordercolor=UI_BORDER,
+        lightcolor=UI_BORDER,
+        darkcolor=UI_BORDER,
+        padding=(6, 5),
+    )
+    style.configure(
+        "TCombobox",
+        fieldbackground=UI_SURFACE,
+        background=UI_SURFACE,
+        foreground=UI_TEXT,
+        arrowcolor=UI_TEXT_MUTED,
+        bordercolor=UI_BORDER,
+        lightcolor=UI_BORDER,
+        darkcolor=UI_BORDER,
+        padding=(5, 4),
+    )
+    style.map(
+        "TCombobox",
+        fieldbackground=[("readonly", UI_SURFACE)],
+        foreground=[("readonly", UI_TEXT)],
+        selectbackground=[("readonly", UI_SURFACE)],
+        selectforeground=[("readonly", UI_TEXT)],
+    )
+    style.configure(
+        "Treeview",
+        background=UI_SURFACE,
+        fieldbackground=UI_SURFACE,
+        foreground=UI_TEXT,
+        bordercolor=UI_BORDER,
+        rowheight=27,
+    )
+    style.map(
+        "Treeview",
+        background=[("selected", UI_ACCENT)],
+        foreground=[("selected", "#ffffff")],
+    )
+    style.configure(
+        "Treeview.Heading",
+        background=UI_TOPBAR,
+        foreground=UI_TEXT,
+        relief="flat",
+        padding=(8, 6),
+    )
+    style.configure(
+        "TLabelframe",
+        background=UI_BACKGROUND,
+        bordercolor=UI_BORDER,
+        relief="flat",
+    )
+    style.configure(
+        "TLabelframe.Label",
+        background=UI_BACKGROUND,
+        foreground=UI_TEXT_MUTED,
+        font=("Segoe UI Semibold", 9),
+    )
 
 SPECIAL_KEY_LABELS = {
     0x08: "Backspace",
@@ -417,6 +637,7 @@ class OpenedCapture:
     capture: cv2.VideoCapture
     backend: str
     display_name: str | None = None
+    source_url: str | None = None
 
 
 @dataclass(frozen=True)
@@ -763,6 +984,58 @@ def network_display_name(stream_url: str) -> str:
     return f"\u7f51\u7edc\u6444\u50cf\u5934 {host or stream_url}"
 
 
+def person_stream_control_base_url(stream_url: str | None) -> str | None:
+    """Return the control URL for the local WSL person stream, when applicable."""
+    if not stream_url:
+        return None
+    parsed = urlsplit(stream_url)
+    if (
+        parsed.scheme.lower() != "http"
+        or (parsed.hostname or "").lower() not in {"127.0.0.1", "localhost", "::1"}
+        or parsed.path.rstrip("/") != "/video_feed"
+    ):
+        return None
+    return urlunsplit((parsed.scheme, parsed.netloc, "", "", ""))
+
+
+def request_person_stream(
+    control_base_url: str,
+    endpoint: str,
+    payload: dict[str, object] | None = None,
+) -> dict[str, object]:
+    """Read or update the local WSL stream service without blocking Tk."""
+    body = None
+    headers: dict[str, str] = {}
+    method = "GET"
+    if payload is not None:
+        body = json.dumps(payload).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+        method = "POST"
+    request = Request(
+        f"{control_base_url.rstrip('/')}{endpoint}",
+        data=body,
+        headers=headers,
+        method=method,
+    )
+    try:
+        with build_opener().open(request, timeout=5) as response:
+            response_payload = json.loads(response.read().decode("utf-8"))
+    except HTTPError as error:
+        try:
+            error_payload = json.loads(error.read().decode("utf-8"))
+            message = error_payload.get("error", str(error))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            message = str(error)
+        raise RuntimeError(f"WSL \u8bc6\u522b\u670d\u52a1\u62d2\u7edd\u4e86\u8bf7\u6c42\uff1a{message}") from error
+    except (URLError, OSError, TimeoutError) as error:
+        raise RuntimeError(f"\u65e0\u6cd5\u8fde\u63a5 WSL \u8bc6\u522b\u670d\u52a1\uff1a{error}") from error
+    if not isinstance(response_payload, dict):
+        raise RuntimeError("WSL \u8bc6\u522b\u670d\u52a1\u8fd4\u56de\u4e86\u65e0\u6548\u7684\u6570\u636e\u3002")
+    if response_payload.get("error"):
+        raise RuntimeError(str(response_payload["error"]))
+    return response_payload
+
+
 def _create_network_capture(stream_url: str, backend_id: int) -> cv2.VideoCapture:
     if backend_id == cv2.CAP_FFMPEG:
         open_timeout = getattr(cv2, "CAP_PROP_OPEN_TIMEOUT_MSEC", None)
@@ -800,6 +1073,7 @@ def open_network_capture(stream_url: str) -> OpenedCapture:
                 capture=capture,
                 backend=backend_name,
                 display_name=network_display_name(stream_url),
+                source_url=stream_url,
             )
         capture.release()
     raise RuntimeError("Could not open the network camera stream.")
@@ -1728,6 +2002,7 @@ class CameraPanel:
         self.capture = opened.capture
         self.camera_index = opened.index
         self.backend = opened.backend
+        self.source_url = opened.source_url
         self.camera_name = opened.display_name or f"\u6444\u50cf\u5934 {self.camera_index}"
         self.frame_interval = 1.0 / max(1, min(manager.fps, 30))
         self.window = manager.preview_window
@@ -1758,8 +2033,8 @@ class CameraPanel:
         placement = self._initial_placement(position, saved_placement)
         self.panel = tk.Frame(
             self.workspace,
-            background="#15191f",
-            highlightbackground="#536171",
+            background=UI_BACKGROUND,
+            highlightbackground=UI_BORDER,
             highlightthickness=1,
         )
         self.panel.place(
@@ -1817,58 +2092,87 @@ class CameraPanel:
         widget.bind("<ButtonRelease-1>", self._finish_drag, add="+")
 
     def _build_ui(self) -> None:
-        header = tk.Frame(self.panel, background="#252d38", height=34)
+        header = tk.Frame(self.panel, background=UI_TOPBAR, height=42)
         header.pack(fill=tk.X)
         header.pack_propagate(False)
+        header.grid_columnconfigure(1, weight=1)
         self.header = header
 
+        self.active_marker = tk.Frame(
+            header,
+            background=UI_BORDER,
+            width=3,
+            height=42,
+        )
+        self.active_marker.grid(row=0, column=0, sticky=tk.NS)
+
         display_name = self.camera_name
-        if len(display_name) > 28:
-            display_name = f"{display_name[:25]}..."
+        if len(display_name) > 24:
+            display_name = f"{display_name[:21]}..."
         name_label = tk.Label(
             header,
-            background="#252d38",
-            foreground="#f1f5f9",
+            background=UI_TOPBAR,
+            foreground=UI_TEXT,
             text=display_name,
             anchor=tk.W,
+            font=("Segoe UI Semibold", 10),
         )
-        name_label.pack(side=tk.LEFT, padx=(8, 0))
-        self.zoom_label = tk.Label(
-            header,
-            background="#252d38",
-            foreground="#cbd5e1",
-            text="\u7f29\u653e x1.0",
-        )
-        self.zoom_label.pack(side=tk.LEFT, padx=(12, 0))
-        self.fps_label = tk.Label(
-            header,
-            background="#252d38",
-            foreground="#cbd5e1",
-            text="0.0 FPS",
-        )
-        self.fps_label.pack(side=tk.LEFT, padx=(12, 0))
-        if self.manager.yolo_pipeline is not None:
-            self.yolo_label = tk.Label(
-                header,
-                background="#252d38",
-                foreground="#86efac",
-                text="YOLO loading",
-            )
-            self.yolo_label.pack(side=tk.LEFT, padx=(12, 0))
+        name_label.grid(row=0, column=1, sticky=tk.EW, padx=(10, 8))
 
-        ttk.Button(header, text="X", width=3, command=self.close).pack(
-            side=tk.RIGHT, padx=(0, 5), pady=3
+        metrics = tk.Frame(header, background=UI_TOPBAR)
+        metrics.grid(row=0, column=2, sticky=tk.E, padx=(0, 8))
+        self.metrics = metrics
+        self.zoom_label = tk.Label(
+            metrics,
+            background=UI_TOPBAR,
+            foreground=UI_TEXT_MUTED,
+            text="x1.0",
+            font=("Segoe UI", 9),
         )
-        ttk.Button(header, text="\u4fdd\u5b58", command=self.save_screenshot).pack(
-            side=tk.RIGHT, padx=(0, 5), pady=3
+        self.zoom_label.pack(side=tk.LEFT, padx=(0, 12))
+        self.fps_label = tk.Label(
+            metrics,
+            background=UI_TOPBAR,
+            foreground=UI_TEXT_MUTED,
+            text="0.0 FPS",
+            font=("Segoe UI", 9),
         )
-        ttk.Button(header, text="\u91cd\u7f6e", command=self.reset_zoom).pack(
-            side=tk.RIGHT, padx=(0, 5), pady=3
-        )
+        self.fps_label.pack(side=tk.LEFT, padx=(0, 12))
+        if self.manager.yolo_config is not None:
+            self.yolo_label = tk.Label(
+                metrics,
+                background=UI_TOPBAR,
+                foreground=UI_WARNING,
+                text="YOLO ...",
+                font=("Segoe UI Semibold", 9),
+            )
+            self.yolo_label.pack(side=tk.LEFT)
+
+        actions = tk.Frame(header, background=UI_TOPBAR)
+        actions.grid(row=0, column=3, sticky=tk.E, padx=(0, 6), pady=5)
+        ttk.Button(
+            actions,
+            text="\u622a\u56fe",
+            style="Panel.TButton",
+            command=self.save_screenshot,
+        ).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(
+            actions,
+            text="\u91cd\u7f6e",
+            style="Panel.TButton",
+            command=self.reset_zoom,
+        ).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(
+            actions,
+            text="\u00d7",
+            width=3,
+            style="Panel.TButton",
+            command=self.close,
+        ).pack(side=tk.LEFT)
 
         self.canvas = tk.Canvas(
             self.panel,
-            background="#101010",
+            background=UI_CANVAS,
             highlightthickness=0,
             takefocus=True,
         )
@@ -1878,12 +2182,18 @@ class CameraPanel:
             16,
             16,
             anchor=tk.NW,
-            fill="#f1f5f9",
+            fill=UI_TEXT,
             font=("Segoe UI", 11),
             text="Opening camera...",
         )
 
-        drag_widgets = [header, name_label, self.zoom_label, self.fps_label]
+        drag_widgets = [
+            header,
+            name_label,
+            metrics,
+            self.zoom_label,
+            self.fps_label,
+        ]
         if self.yolo_label is not None:
             drag_widgets.append(self.yolo_label)
         for widget in drag_widgets:
@@ -1924,6 +2234,15 @@ class CameraPanel:
         else:
             self.header.pack_forget()
             self.panel.configure(highlightthickness=0)
+
+    def set_active(self, active: bool) -> None:
+        """Make the selected camera clear without changing panel geometry."""
+        color = UI_BORDER_ACTIVE if active else UI_BORDER
+        try:
+            self.panel.configure(highlightbackground=color)
+            self.active_marker.configure(background=color)
+        except tk.TclError:
+            pass
 
     def _activate_panel(self, _event=None) -> None:
         self.manager.activate_panel(self)
@@ -1971,7 +2290,7 @@ class CameraPanel:
         panel_width = max(1, self.panel.winfo_width())
         panel_height = max(1, self.panel.winfo_height())
         visible_header_width = min(120, panel_width)
-        visible_header_height = min(34, panel_height)
+        visible_header_height = min(42, panel_height)
         max_x = max(0, self.workspace.winfo_width() - visible_header_width)
         max_y = max(0, self.workspace.winfo_height() - visible_header_height)
         self.panel.place_configure(
@@ -1998,8 +2317,9 @@ class CameraPanel:
                 self.frame_count += 1
                 self.frame_sequence += 1
                 sequence = self.frame_sequence
-            if self.manager.yolo_pipeline is not None:
-                self.manager.yolo_pipeline.submit(
+            pipeline = self.manager.yolo_pipeline
+            if pipeline is not None:
+                pipeline.submit(
                     self.camera_index,
                     sequence,
                     frame.copy(),
@@ -2097,16 +2417,20 @@ class CameraPanel:
     def _update_yolo_label(self) -> None:
         if self.yolo_label is None:
             return
-        stats = self.manager.yolo_pipeline.stats()
+        pipeline = self.manager.yolo_pipeline
+        if pipeline is None:
+            self.yolo_label.configure(text="YOLO \u5173", foreground=UI_TEXT_MUTED)
+            return
+        stats = pipeline.stats()
         if stats.error:
             text = "YOLO error"
-            color = "#fca5a5"
+            color = UI_DANGER
         elif not stats.ready:
-            text = "YOLO loading"
-            color = "#fde68a"
+            text = "YOLO ..."
+            color = UI_WARNING
         else:
             text = f"YOLO {stats.fps:.1f} FPS"
-            color = "#86efac"
+            color = UI_SUCCESS
         self.yolo_label.configure(text=text, foreground=color)
 
     def _draw_frame(self) -> None:
@@ -2129,7 +2453,7 @@ class CameraPanel:
             self.canvas.coords(self.image_id, left, top)
             self.canvas.tag_lower(self.image_id)
             self.image_bounds = (left, top, display_width, display_height)
-            self.zoom_label.configure(text=f"\u7f29\u653e x{self.zoom_view.zoom:.1f}")
+            self.zoom_label.configure(text=f"x{self.zoom_view.zoom:.1f}")
             self.fps_label.configure(text=f"{self.fps:.1f} FPS")
             if time.perf_counter() > self.status_until:
                 self.status_text = ""
@@ -2232,8 +2556,10 @@ class CameraManager:
             if isinstance(opened.index, int) and opened.index >= 0
         )
         self.root = tk.Tk()
+        configure_ui_style(self.root)
         self.root.withdraw()
         self.root.protocol("WM_DELETE_WINDOW", self.close_all)
+        self.yolo_config = yolo_config
         self.yolo_pipeline = YoloPipeline(yolo_config) if yolo_config is not None else None
         self.windows: dict[int | str, CameraPanel] = {}
         self.panel_placements = load_panel_placements()
@@ -2258,8 +2584,22 @@ class CameraManager:
         self.workspace: tk.Frame | None = None
         self.active_panel: CameraPanel | None = None
         self.preview_fullscreen = False
-        self.topmost_button: ttk.Button | None = None
-        self.borderless_button: ttk.Button | None = None
+        self.preview_service_label: ttk.Label | None = None
+        self.preview_source_label: ttk.Label | None = None
+        self.topmost_button: ttk.Checkbutton | None = None
+        self.borderless_button: ttk.Checkbutton | None = None
+        self.person_stream_yolo_button: ttk.Checkbutton | None = None
+        self.person_stream_collection_button: ttk.Checkbutton | None = None
+        self.person_stream_target_capture_button: ttk.Checkbutton | None = None
+        self._topmost_var = tk.BooleanVar(master=self.root, value=self.always_on_top)
+        self._borderless_var = tk.BooleanVar(master=self.root, value=self.borderless)
+        self._person_stream_yolo_var = tk.BooleanVar(master=self.root, value=False)
+        self._person_stream_collection_var = tk.BooleanVar(
+            master=self.root, value=False
+        )
+        self._person_stream_target_capture_var = tk.BooleanVar(
+            master=self.root, value=False
+        )
         self._show_launcher_when_empty = not captures
         self.launcher_window: tk.Toplevel | None = None
         self.launcher_scan_button: ttk.Button | None = None
@@ -2267,6 +2607,13 @@ class CameraManager:
         self._local_scan_events = queue.SimpleQueue()
         self._local_scan_poll_after_id: str | None = None
         self._local_scan_running = False
+        self._person_stream_events = queue.SimpleQueue()
+        self._person_stream_operation: str | None = None
+        self._person_stream_status: dict[str, object] | None = None
+        self._person_stream_status_requested_at = 0.0
+        self._person_stream_poll_after_id: str | None = self.root.after(
+            80, self._poll_person_stream_events
+        )
         self._borderless_fit_after_id: str | None = None
         self._network_dialog_cleanups: set = set()
         self.shutting_down = False
@@ -2319,6 +2666,318 @@ class CameraManager:
             )
         except tk.TclError:
             self.lan_stream_button = None
+
+    def _person_stream_control_base_url(self) -> str | None:
+        control_urls = {
+            control_url
+            for panel in self.windows.values()
+            if (
+                control_url := person_stream_control_base_url(panel.source_url)
+            ) is not None
+        }
+        return control_urls.pop() if len(control_urls) == 1 else None
+
+    def _person_stream_yolo_enabled(self) -> bool | None:
+        status = self._person_stream_status
+        if not isinstance(status, dict):
+            return None
+        yolo = status.get("yolo")
+        if not isinstance(yolo, dict):
+            return None
+        enabled = yolo.get("enabled")
+        return enabled if isinstance(enabled, bool) else None
+
+    def _person_stream_collection(self) -> dict[str, object] | None:
+        status = self._person_stream_status
+        if not isinstance(status, dict):
+            return None
+        collection = status.get("collection")
+        return collection if isinstance(collection, dict) else None
+
+    def _person_stream_target_capture(self) -> dict[str, object] | None:
+        status = self._person_stream_status
+        if not isinstance(status, dict):
+            return None
+        target_capture = status.get("target_capture")
+        return target_capture if isinstance(target_capture, dict) else None
+
+    def _update_preview_status_labels(self) -> None:
+        if self.preview_source_label is not None:
+            try:
+                count = len(self.windows)
+                self.preview_source_label.configure(
+                    text=f"{count} \u8def\u89c6\u9891" if count else "\u672a\u8fde\u63a5\u89c6\u9891"
+                )
+            except tk.TclError:
+                self.preview_source_label = None
+
+        label = self.preview_service_label
+        if label is None:
+            return
+        control_available = self._person_stream_control_base_url() is not None
+        status = self._person_stream_status
+        text = "\u672c\u5730\u9884\u89c8"
+        style = "Service.TLabel"
+        if control_available and self._person_stream_operation not in (None, "status"):
+            text = "\u8bc6\u522b\u670d\u52a1\u5904\u7406\u4e2d"
+            style = "ServiceBusy.TLabel"
+        elif control_available and not isinstance(status, dict):
+            text = "\u8fde\u63a5\u8bc6\u522b\u670d\u52a1"
+            style = "ServiceBusy.TLabel"
+        elif control_available:
+            error = status.get("error")
+            yolo = status.get("yolo")
+            pose = status.get("pose")
+            if error:
+                text = "\u8bc6\u522b\u670d\u52a1\u5f02\u5e38"
+                style = "ServiceError.TLabel"
+            elif isinstance(yolo, dict) and yolo.get("enabled") is False:
+                text = "\u8bc6\u522b\u5df2\u5173\u95ed"
+            else:
+                mode = "YOLO \u8bc6\u522b"
+                if isinstance(pose, dict) and pose.get("ready") is True:
+                    mode = "\u59ff\u6001\u8bc6\u522b"
+                fps = status.get("fps")
+                if isinstance(fps, (int, float)):
+                    text = f"\u25cf {mode}  {fps:.0f} FPS"
+                else:
+                    text = f"\u25cf {mode}"
+                style = "ServiceReady.TLabel"
+        try:
+            label.configure(text=text, style=style)
+        except tk.TclError:
+            self.preview_service_label = None
+
+    def _set_person_stream_message(self, text: str) -> None:
+        panel = self.active_panel
+        if panel is None or not panel.running:
+            panel = next(
+                (candidate for candidate in self.windows.values() if candidate.running),
+                None,
+            )
+        if panel is not None:
+            panel.set_status(text)
+        else:
+            self._set_launcher_status(text)
+
+    def _update_person_stream_controls(self) -> None:
+        control_available = self._person_stream_control_base_url() is not None
+        busy = self._person_stream_operation not in (None, "status")
+
+        if self.person_stream_yolo_button is not None:
+            if control_available:
+                enabled = self._person_stream_yolo_enabled()
+                if enabled is None:
+                    state = tk.DISABLED
+                    self._person_stream_yolo_var.set(False)
+                else:
+                    state = tk.DISABLED if busy else tk.NORMAL
+                    self._person_stream_yolo_var.set(enabled)
+            elif self.yolo_config is not None:
+                self._person_stream_yolo_var.set(self.yolo_pipeline is not None)
+                state = tk.NORMAL
+            else:
+                self._person_stream_yolo_var.set(False)
+                state = tk.DISABLED
+            try:
+                self.person_stream_yolo_button.configure(state=state)
+            except tk.TclError:
+                self.person_stream_yolo_button = None
+
+        if self.person_stream_collection_button is not None:
+            collection = self._person_stream_collection()
+            active = collection.get("active") if collection is not None else None
+            self._person_stream_collection_var.set(active is True)
+            state = (
+                tk.NORMAL
+                if control_available and collection is not None and not busy
+                else tk.DISABLED
+            )
+            try:
+                self.person_stream_collection_button.configure(state=state)
+            except tk.TclError:
+                self.person_stream_collection_button = None
+
+        if self.person_stream_target_capture_button is not None:
+            target_capture = self._person_stream_target_capture()
+            enabled = (
+                target_capture.get("enabled") if target_capture is not None else None
+            )
+            if control_available and isinstance(enabled, bool):
+                if self._person_stream_operation != "target-capture":
+                    self._person_stream_target_capture_var.set(enabled)
+                state = tk.DISABLED if busy else tk.NORMAL
+            else:
+                self._person_stream_target_capture_var.set(False)
+                state = tk.DISABLED
+            try:
+                self.person_stream_target_capture_button.configure(state=state)
+            except tk.TclError:
+                self.person_stream_target_capture_button = None
+        self._update_preview_status_labels()
+
+    def _start_person_stream_request(
+        self,
+        operation: str,
+        endpoint: str,
+        payload: dict[str, object] | None = None,
+    ) -> None:
+        control_base_url = self._person_stream_control_base_url()
+        if control_base_url is None:
+            self._person_stream_status = None
+            self._update_person_stream_controls()
+            self._set_person_stream_message("\u672a\u8fde\u63a5 WSL \u4eba\u7269\u8bc6\u522b\u89c6\u9891\u6d41\u3002")
+            return
+        if self._person_stream_operation is not None:
+            return
+        self._person_stream_operation = operation
+        self._update_person_stream_controls()
+
+        def worker() -> None:
+            try:
+                status = request_person_stream(control_base_url, endpoint, payload)
+            except Exception as error:
+                self._person_stream_events.put((operation, None, str(error)))
+            else:
+                self._person_stream_events.put((operation, status, None))
+
+        threading.Thread(
+            target=worker,
+            name=f"person-stream-{operation}",
+            daemon=True,
+        ).start()
+
+    def _refresh_person_stream_status(self) -> None:
+        if self._person_stream_control_base_url() is None:
+            self._person_stream_status = None
+            self._update_person_stream_controls()
+            return
+        self._person_stream_status_requested_at = time.monotonic()
+        self._start_person_stream_request("status", "/status")
+
+    def _poll_person_stream_events(self) -> None:
+        self._person_stream_poll_after_id = None
+        try:
+            while True:
+                operation, status, error = self._person_stream_events.get_nowait()
+                self._person_stream_operation = None
+                if error is not None:
+                    self._set_person_stream_message(str(error))
+                    continue
+                if not isinstance(status, dict):
+                    self._set_person_stream_message("WSL \u8bc6\u522b\u670d\u52a1\u8fd4\u56de\u4e86\u65e0\u6548\u72b6\u6001\u3002")
+                    continue
+                self._person_stream_status = status
+                if operation == "yolo":
+                    enabled = self._person_stream_yolo_enabled()
+                    self._set_person_stream_message(
+                        "YOLO \u8bc6\u522b\u5df2\u5f00\u542f\u3002"
+                        if enabled
+                        else "YOLO \u8bc6\u522b\u5df2\u5173\u95ed\u3002"
+                    )
+                elif operation == "collection":
+                    collection = self._person_stream_collection() or {}
+                    active = collection.get("active") is True
+                    count = collection.get("count", 0)
+                    if active:
+                        self._set_person_stream_message(
+                            "\u6b63\u5728\u91c7\u96c6\u539f\u59cb\u8bad\u7ec3\u56fe\uff1a\u6bcf\u79d2 1 \u5f20\u3002"
+                        )
+                    else:
+                        self._set_person_stream_message(
+                            f"\u5df2\u505c\u6b62\u91c7\u96c6\uff0c\u672c\u6b21\u5df2\u4fdd\u5b58 {count} \u5f20\u539f\u59cb\u56fe\u7247\u3002"
+                        )
+                elif operation == "target-capture":
+                    target_capture = self._person_stream_target_capture() or {}
+                    if target_capture.get("enabled") is True:
+                        self._set_person_stream_message(
+                            "\u76ee\u6807\u81ea\u52a8\u622a\u56fe\u5df2\u5f00\u542f\uff0c\u8bc6\u522b\u5230\u76ee\u6807 1 \u65f6\u4f1a\u81ea\u52a8\u4fdd\u5b58\u3002"
+                        )
+                    else:
+                        self._set_person_stream_message(
+                            "\u76ee\u6807\u81ea\u52a8\u622a\u56fe\u5df2\u5173\u95ed\u3002"
+                        )
+        except queue.Empty:
+            pass
+        self._update_person_stream_controls()
+        if (
+            self._person_stream_control_base_url() is not None
+            and self._person_stream_operation is None
+            and time.monotonic() - self._person_stream_status_requested_at
+            >= PERSON_STREAM_STATUS_INTERVAL_SECONDS
+        ):
+            self._refresh_person_stream_status()
+        if not self.shutting_down:
+            try:
+                self._person_stream_poll_after_id = self.root.after(
+                    80, self._poll_person_stream_events
+                )
+            except tk.TclError:
+                pass
+
+    def toggle_yolo(self) -> None:
+        if self._person_stream_control_base_url() is not None:
+            enabled = self._person_stream_yolo_enabled()
+            if enabled is None:
+                self._set_person_stream_message("\u6b63\u5728\u8bfb\u53d6 YOLO \u72b6\u6001\u2026")
+                self._refresh_person_stream_status()
+                return
+            self._start_person_stream_request(
+                "yolo", "/control/yolo", {"enabled": not enabled}
+            )
+            return
+
+        if self.yolo_config is None:
+            self._set_person_stream_message("\u5f53\u524d\u89c6\u9891\u6d41\u6ca1\u6709\u914d\u7f6e\u672c\u5730 YOLO \u6a21\u578b\u3002")
+            return
+        if self.yolo_pipeline is None:
+            self.yolo_pipeline = YoloPipeline(self.yolo_config)
+            self._set_person_stream_message("YOLO \u6b63\u5728\u52a0\u8f7d\u2026")
+        else:
+            pipeline = self.yolo_pipeline
+            self.yolo_pipeline = None
+            pipeline.close()
+            self._set_person_stream_message("YOLO \u8bc6\u522b\u5df2\u5173\u95ed\u3002")
+        self._update_person_stream_controls()
+
+    def toggle_sample_collection(self) -> None:
+        collection = self._person_stream_collection()
+        if self._person_stream_control_base_url() is None or collection is None:
+            self._set_person_stream_message("\u8bf7\u5148\u7b49\u5f85 WSL \u91c7\u96c6\u670d\u52a1\u5c31\u7eea\u3002")
+            self._refresh_person_stream_status()
+            return
+        active = collection.get("active") is True
+        self._start_person_stream_request(
+            "collection",
+            "/control/collection",
+            {
+                "enabled": not active,
+                "interval_seconds": 1.0,
+            },
+        )
+
+    def toggle_target_capture(self) -> None:
+        target_capture = self._person_stream_target_capture()
+        if self._person_stream_control_base_url() is None or target_capture is None:
+            self._person_stream_target_capture_var.set(False)
+            self._set_person_stream_message(
+                "\u8bf7\u5148\u7b49\u5f85 WSL \u4eba\u7269\u8bc6\u522b\u670d\u52a1\u5c31\u7eea\u3002"
+            )
+            self._refresh_person_stream_status()
+            return
+        enabled = target_capture.get("enabled")
+        if not isinstance(enabled, bool):
+            self._person_stream_target_capture_var.set(False)
+            self._refresh_person_stream_status()
+            return
+        desired = bool(self._person_stream_target_capture_var.get())
+        if desired == enabled:
+            return
+        self._start_person_stream_request(
+            "target-capture",
+            "/control/target-capture",
+            {"enabled": desired},
+        )
 
     def stop_lan_stream(self) -> None:
         server = self.lan_stream_server
@@ -2621,12 +3280,18 @@ class CameraManager:
             self.workspace = None
             self.topmost_button = None
             self.borderless_button = None
+            self.preview_service_label = None
+            self.preview_source_label = None
             self.lan_stream_button = None
+            self.person_stream_yolo_button = None
+            self.person_stream_collection_button = None
+            self.person_stream_target_capture_button = None
 
         window = tk.Toplevel(self.root)
         self.preview_window = window
         window.title(WINDOW_TITLE)
-        window.minsize(720, 480)
+        window.configure(background=UI_BACKGROUND)
+        window.minsize(MIN_MAIN_WINDOW_WIDTH, MIN_MAIN_WINDOW_HEIGHT)
         if self.main_window_placement is not None:
             window.geometry(self._geometry_from_placement(self.main_window_placement))
         else:
@@ -2635,48 +3300,160 @@ class CameraManager:
             )
         window.protocol("WM_DELETE_WINDOW", self.close_all)
 
-        toolbar = ttk.Frame(window, padding=(8, 6))
+        toolbar = ttk.Frame(window, style="Topbar.TFrame")
         self.preview_toolbar = toolbar
         toolbar.pack(fill=tk.X)
-        ttk.Label(toolbar, text=WINDOW_TITLE, font=("Segoe UI", 11)).pack(side=tk.LEFT)
-        ttk.Button(toolbar, text="\u5173\u95ed", command=self.close_all).pack(side=tk.RIGHT)
-        ttk.Button(toolbar, text="\u5168\u5c4f", command=self.toggle_fullscreen).pack(
-            side=tk.RIGHT, padx=(0, 6)
+
+        title_row = ttk.Frame(toolbar, style="Toolbar.TFrame", padding=(12, 8))
+        title_row.pack(fill=tk.X)
+        brand_marker = tk.Frame(
+            title_row,
+            background=UI_ACCENT,
+            width=4,
+            height=30,
         )
-        self.borderless_button = ttk.Button(
-            toolbar,
+        brand_marker.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 10))
+        title_stack = ttk.Frame(title_row, style="Toolbar.TFrame")
+        title_stack.pack(side=tk.LEFT)
+        ttk.Label(title_stack, text=WINDOW_TITLE, style="Title.TLabel").pack(
+            anchor=tk.W
+        )
+        self.preview_source_label = ttk.Label(
+            title_stack,
+            text="\u672a\u8fde\u63a5\u89c6\u9891",
+            style="Subtitle.TLabel",
+        )
+        self.preview_source_label.pack(anchor=tk.W)
+        self.preview_service_label = ttk.Label(
+            title_row,
+            text="\u672c\u5730\u9884\u89c8",
+            style="Service.TLabel",
+        )
+        self.preview_service_label.pack(side=tk.LEFT, padx=(14, 0))
+
+        view_actions = ttk.Frame(title_row, style="Toolbar.TFrame")
+        view_actions.pack(side=tk.RIGHT)
+        ttk.Button(
+            view_actions,
+            text="\u5168\u5c4f",
+            width=6,
+            style="Toolbar.TButton",
+            command=self.toggle_fullscreen,
+        ).pack(side=tk.RIGHT)
+        self.borderless_button = ttk.Checkbutton(
+            view_actions,
+            text="\u7eaf\u753b\u9762",
+            width=7,
+            style="Toggle.TCheckbutton",
+            variable=self._borderless_var,
             command=self.toggle_borderless,
         )
-        self.borderless_button.pack(side=tk.RIGHT, padx=(0, 6))
-        self.topmost_button = ttk.Button(
-            toolbar,
+        self.borderless_button.pack(side=tk.RIGHT, padx=(0, 5))
+        self.topmost_button = ttk.Checkbutton(
+            view_actions,
+            text="\u7f6e\u9876",
+            width=5,
+            style="Toggle.TCheckbutton",
+            variable=self._topmost_var,
             command=self.toggle_always_on_top,
         )
-        self.topmost_button.pack(side=tk.RIGHT, padx=(0, 6))
+        self.topmost_button.pack(side=tk.RIGHT, padx=(0, 5))
         ttk.Button(
-            toolbar,
+            view_actions,
             text="\u5feb\u6377\u952e",
+            width=7,
+            style="Toolbar.TButton",
             command=lambda: self.open_hotkey_dialog(window),
-        ).pack(side=tk.RIGHT, padx=(0, 6))
+        ).pack(side=tk.RIGHT, padx=(0, 5))
+
+        ttk.Separator(toolbar, orient=tk.HORIZONTAL).pack(fill=tk.X)
+        action_row = ttk.Frame(toolbar, style="Toolbar.TFrame", padding=(12, 7))
+        action_row.pack(fill=tk.X)
+
+        device_group = ttk.Frame(action_row, style="Toolbar.TFrame")
+        device_group.pack(side=tk.LEFT)
+        ttk.Label(device_group, text="\u8bbe\u5907", style="Group.TLabel").pack(
+            side=tk.LEFT, padx=(0, 7)
+        )
         ttk.Button(
-            toolbar,
+            device_group,
+            text="\u5207\u6362",
+            width=6,
+            style="Toolbar.TButton",
+            command=self.switch_camera,
+        ).pack(side=tk.LEFT)
+        ttk.Button(
+            device_group,
+            text="\u626b\u63cf",
+            width=6,
+            style="Toolbar.TButton",
+            command=self.scan_for_cameras,
+        ).pack(side=tk.LEFT, padx=(5, 0))
+        ttk.Button(
+            device_group,
             text="\u7f51\u7edc",
+            width=6,
+            style="Toolbar.TButton",
             command=lambda: self.open_network_camera_dialog(window),
-        ).pack(side=tk.RIGHT, padx=(0, 6))
+        ).pack(side=tk.LEFT, padx=(5, 0))
+
+        ttk.Separator(
+            action_row, orient=tk.VERTICAL, style="Toolbar.TSeparator"
+        ).pack(side=tk.LEFT, fill=tk.Y, padx=12)
+        recognition_group = ttk.Frame(action_row, style="Toolbar.TFrame")
+        recognition_group.pack(side=tk.LEFT)
+        ttk.Label(
+            recognition_group, text="\u8bc6\u522b", style="Group.TLabel"
+        ).pack(side=tk.LEFT, padx=(0, 5))
+        self.person_stream_yolo_button = ttk.Checkbutton(
+            recognition_group,
+            text="YOLO",
+            width=6,
+            style="Yolo.Toggle.TCheckbutton",
+            variable=self._person_stream_yolo_var,
+            command=self.toggle_yolo,
+        )
+        self.person_stream_yolo_button.pack(side=tk.LEFT)
+        self.person_stream_target_capture_button = ttk.Checkbutton(
+            recognition_group,
+            text="\u76ee\u6807\u622a\u56fe",
+            width=9,
+            style="Capture.Toggle.TCheckbutton",
+            variable=self._person_stream_target_capture_var,
+            command=self.toggle_target_capture,
+        )
+        self.person_stream_target_capture_button.pack(side=tk.LEFT, padx=(3, 0))
+
+        ttk.Separator(
+            action_row, orient=tk.VERTICAL, style="Toolbar.TSeparator"
+        ).pack(side=tk.LEFT, fill=tk.Y, padx=12)
+        capture_group = ttk.Frame(action_row, style="Toolbar.TFrame")
+        capture_group.pack(side=tk.LEFT)
+        ttk.Label(capture_group, text="\u91c7\u96c6", style="Group.TLabel").pack(
+            side=tk.LEFT, padx=(0, 5)
+        )
+        self.person_stream_collection_button = ttk.Checkbutton(
+            capture_group,
+            text="\u6837\u672c\u91c7\u96c6",
+            width=9,
+            style="Recording.Toggle.TCheckbutton",
+            variable=self._person_stream_collection_var,
+            command=self.toggle_sample_collection,
+        )
+        self.person_stream_collection_button.pack(side=tk.LEFT)
         self.lan_stream_button = ttk.Button(
-            toolbar,
+            capture_group,
+            width=12,
+            style="Toolbar.TButton",
             command=lambda: self.open_lan_stream_dialog(window),
         )
-        self.lan_stream_button.pack(side=tk.RIGHT, padx=(0, 6))
+        self.lan_stream_button.pack(side=tk.LEFT, padx=(5, 0))
         self._update_lan_stream_button()
-        ttk.Button(toolbar, text="\u626b\u63cf", command=self.scan_for_cameras).pack(
-            side=tk.RIGHT, padx=(0, 6)
-        )
-        ttk.Button(toolbar, text="\u5207\u6362", command=self.switch_camera).pack(
-            side=tk.RIGHT, padx=(0, 6)
-        )
+        self._update_person_stream_controls()
 
-        self.workspace = tk.Frame(window, background="#0f141b", highlightthickness=0)
+        self.workspace = tk.Frame(
+            window, background=UI_WORKSPACE, highlightthickness=0
+        )
         self.workspace.pack(fill=tk.BOTH, expand=True)
         self.workspace.bind(
             "<Motion>", self.update_borderless_window_cursor, add="+"
@@ -2756,17 +3533,9 @@ class CameraManager:
 
     def _update_preview_display_buttons(self) -> None:
         if self.topmost_button is not None:
-            self.topmost_button.configure(
-                text="\u53d6\u6d88\u7f6e\u9876"
-                if self.always_on_top
-                else "\u7f6e\u9876"
-            )
+            self._topmost_var.set(self.always_on_top)
         if self.borderless_button is not None:
-            self.borderless_button.configure(
-                text="\u663e\u793a\u8fb9\u6846"
-                if self.borderless
-                else "\u7eaf\u753b\u9762"
-            )
+            self._borderless_var.set(self.borderless)
 
     def _apply_preview_display_options(self) -> None:
         if self.preview_window is None:
@@ -2775,8 +3544,8 @@ class CameraManager:
             self.preview_window.attributes("-topmost", self.always_on_top)
             self.preview_window.overrideredirect(self.borderless)
             self.preview_window.minsize(
-                1 if self.borderless else 720,
-                1 if self.borderless else 480,
+                1 if self.borderless else MIN_MAIN_WINDOW_WIDTH,
+                1 if self.borderless else MIN_MAIN_WINDOW_HEIGHT,
             )
             if self.preview_toolbar is not None:
                 if self.borderless:
@@ -3362,6 +4131,8 @@ class CameraManager:
     def activate_panel(self, panel: CameraPanel) -> None:
         if not panel.running:
             return
+        for candidate in self.windows.values():
+            candidate.set_active(candidate is panel)
         self.active_panel = panel
         try:
             panel.panel.lift()
@@ -3408,6 +4179,7 @@ class CameraManager:
         self._show_preview_window()
         self._schedule_borderless_fit()
         self._refresh_lan_stream_panels()
+        self._refresh_person_stream_status()
         return True
 
     def _apply_capture_performance_profile(self) -> None:
@@ -4126,9 +4898,12 @@ class CameraManager:
         if self.windows.get(panel.camera_index) is panel:
             del self.windows[panel.camera_index]
         self._refresh_lan_stream_panels()
+        self._refresh_person_stream_status()
         self._windowed_panel_placements.pop(panel.camera_index, None)
         if self.active_panel is panel:
             self.active_panel = next(iter(self.windows.values()), None)
+        if self.active_panel is not None:
+            self.activate_panel(self.active_panel)
         self._apply_capture_performance_profile()
         if self.windows and self.borderless:
             self._schedule_borderless_fit()
@@ -4148,6 +4923,7 @@ class CameraManager:
             self._hotkey_poll_after_id,
             self._close_after_id,
             self._local_scan_poll_after_id,
+            self._person_stream_poll_after_id,
             self._borderless_fit_after_id,
         ):
             if callback_id is None:
@@ -4160,6 +4936,7 @@ class CameraManager:
         self._close_after_id = None
         self._local_scan_poll_after_id = None
         self._local_scan_running = False
+        self._person_stream_poll_after_id = None
         self._borderless_fit_after_id = None
         self._stop_hotkey_listener()
         self.stop_lan_stream()

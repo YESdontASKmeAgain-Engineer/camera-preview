@@ -1,2 +1,3 @@
 # Install this optional layer in the WSL YOLO environment.
+flask>=3.0
 ultralytics>=8.3.0

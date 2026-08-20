@@ -11,7 +11,11 @@ dist/
 
 # User-generated files
 screenshots/
+training_samples/
 camera_preview_settings.json
+
+# Downloaded and locally trained model weights
+models/*.pt
 
 # Local editor and operating-system files
 .vscode/
